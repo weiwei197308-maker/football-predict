@@ -1,0 +1,39 @@
+# ---- 大体积安装包（不入库）----
+Miniforge3.sh
+
+# ---- 系统与缓存 ----
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ---- 备份副本与历史版本 ----
+*.bak.csv
+*.bak
+backups/
+analyze的副本*.py
+compare_report_backup.py
+compare_report_patched.py
+项目交接备忘的副本.md
+*.orig
+*.rej
+
+# ---- 临时垃圾文件 ----
+0
+=
+1~
+
+# ---- 本地密钥/环境（勿入库）----
+.env
+*.env
+.zshrc
+*.pem
+*.key
+secrets.*
+
+# ---- 含硬编码凭据的源文件（本地保留，不入库）----
+football_history.py
+
+# ---- 运行产物：每日报告 / 预测快照 / 复盘 / 深度归因 / 运行日志 ----
+output/
