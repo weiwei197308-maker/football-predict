@@ -32,8 +32,5 @@ compare_report_patched.py
 *.key
 secrets.*
 
-# ---- 含硬编码凭据的源文件（本地保留，不入库）----
-football_history.py
-
 # ---- 运行产物：每日报告 / 预测快照 / 复盘 / 深度归因 / 运行日志 ----
 output/
