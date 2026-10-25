@@ -18,13 +18,44 @@
     "hit_ttg": True/False,  # 总进球命中
     "hit_hafu": True/False, # 半全场命中
     "hit_crs": True/False,  # 比分命中
-    "归因": "...",          # 错误归因文本，命中无误时为 None
+    "归因": "...",          # 错误归因文本，命中无误时为 None；
+                            # 存在 深度归因_<date>.json 时按编号覆盖为深度归因（带【深度归因】前缀）
   },
   ...
 }
 """
 import json
 import os
+
+
+def load_deep_attributions(date_str, output_dir="output"):
+    """读取 output/深度归因_<date>.json，返回 {编号: 深度归因单行文本}。
+
+    文件不存在 / 损坏 / 字段缺失时返回 {}（安全降级，调用方沿用每日记录旧归因）。
+    占位失败文本（"(深度归因调用失败…"）不算有效深度归因，跳过。
+    """
+    path = os.path.join(output_dir, f"深度归因_{date_str}.json")
+    if not os.path.exists(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"  [警告] 读取 {path} 失败: {e}（沿用旧归因）")
+        return {}
+
+    deep = {}
+    for item in data.get("场次", []):
+        num = str(item.get("编号") or "").strip()
+        text = item.get("深度归因")
+        if not num or not isinstance(text, str):
+            continue
+        text = " ".join(text.split())  # 折叠换行，保持 CSV 单元格单行
+        if not text or text.startswith("(深度归因调用失败"):
+            continue
+        deep[num] = text
+    return deep
 
 
 def load_review_data(date_str, output_dir="output"):
@@ -65,4 +96,15 @@ def load_review_data(date_str, output_dir="output"):
             "hit_crs": bool(hit.get("比分", False)),
             "归因": item.get("错误归因"),
         }
+
+    # 深度归因优先：存在 深度归因_<date>.json 时按编号覆盖旧"高估/低估"式归因；
+    # 文件缺失/损坏/无匹配场次时安全降级，沿用每日记录旧归因。
+    deep = load_deep_attributions(date_str, output_dir)
+    overridden = 0
+    for num, text in deep.items():
+        if num in result:
+            result[num]["归因"] = f"【深度归因】{text}"
+            overridden += 1
+    if deep:
+        print(f"  [深度归因] {date_str}: 覆盖 {overridden}/{len(deep)} 场")
     return result

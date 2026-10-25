@@ -47,5 +47,24 @@ for d in "${DATES[@]}"; do
     echo ""
 done
 
+# 软失败步骤包装：失败只打印警告，不中断脚本（参照 run_all.sh 深度归因步骤的容错方式）
+run_step_soft() {
+    local label="$1"; local fail_msg="$2"; shift 2
+    echo "▶ $label"
+    if "$@"; then
+        echo "✅ $label 完成"
+    else
+        local rc=$?
+        # 注意：macOS bash 3.2 在双引号内"$var<多字节字符>"相邻时会吞掉变量及后续前导字节，
+        # 故此处用 printf 拼接，保证失败消息字节正确（不要用 echo "$var（..."）
+        printf '%s（退出码 %s，可选步骤，不影响上方模拟盘更新结果）\n' "$fail_msg" "$rc"
+    fi
+    echo ""
+}
+
+echo ""
+echo "---------- 错题归因总表（第 5 张表，可选步骤） ----------"
+run_step_soft "错题归因总表生成" "⚠️ 错题归因总表生成失败，跳过" python3 build_attribution_table.py
+
 echo "==================== 全部完成 ===================="
 echo "本次运行日志：$LOG_FILE"
