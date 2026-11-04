@@ -9,13 +9,14 @@ import subprocess
 import sys
 
 from review import (
-    load_tecai_data, get_result_label, get_result_after_handicap,
+    load_tecai_data, get_result_after_handicap,
     check_spf, check_rq, check_ttg, check_crs, check_hafu, generate_report,
 )
 from get_results import (
     fetch_tecai_results, parse_score,
     get_result_from_win_flag, get_result_code_from_win_flag,
 )
+from lottery_rules import get_result_label, cn_to_code
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
@@ -77,7 +78,9 @@ def process_date(date_str):
 
     results = []
     stats = {"total": 0, "spf_hit": 0, "rq_hit": 0,
-              "ttg_hit": 0, "hafu_hit": 0, "crs_hit": 0}
+              "ttg_hit": 0, "hafu_hit": 0, "crs_hit": 0,
+              "spf_valid": 0, "rq_valid": 0, "ttg_valid": 0,
+              "hafu_valid": 0, "crs_valid": 0}
 
     for ana in analysis_rows:
         num = ana.get("编号", "")
@@ -97,11 +100,11 @@ def process_date(date_str):
         if h_full is None or a_full is None:
             continue
 
-        actual_spf_label = get_result_from_win_flag(win_flag) or get_result_label(h_full, a_full)[0]
+        actual_spf_label = get_result_from_win_flag(win_flag) or get_result_label(h_full, a_full)
         actual_rq_label, _ = get_result_after_handicap(h_full, a_full, goal_line)
         actual_total = h_full + a_full
-        half_code = get_result_label(h_half, a_half)[1] if h_half is not None else "?"
-        full_code = get_result_label(h_full, a_full)[1]
+        half_code = cn_to_code(get_result_label(h_half, a_half)) if h_half is not None else "?"
+        full_code = cn_to_code(get_result_label(h_full, a_full))
 
         pred_spf = ana.get("胜平负推荐", "")
         pred_rq = ana.get("让球推荐", "")
@@ -117,11 +120,13 @@ def process_date(date_str):
         hafu_hit, hafu_actual = check_hafu(pred_hafu, half_code, full_code)
 
         stats["total"] += 1
-        if spf_hit: stats["spf_hit"] += 1
-        if rq_hit: stats["rq_hit"] += 1
-        if ttg_hit: stats["ttg_hit"] += 1
-        if crs_hit: stats["crs_hit"] += 1
-        if hafu_hit: stats["hafu_hit"] += 1
+        # 三态统计：None（无效/无法判定）不进有效场次与命中数
+        for key, val in (("spf", spf_hit), ("rq", rq_hit), ("ttg", ttg_hit),
+                         ("hafu", hafu_hit), ("crs", crs_hit)):
+            if val is not None:
+                stats[f"{key}_valid"] += 1
+                if val:
+                    stats[f"{key}_hit"] += 1
 
         result = {
             "num": num,

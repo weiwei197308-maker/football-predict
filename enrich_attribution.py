@@ -23,6 +23,8 @@
 诚实性约束：
   深度归因为联网搜索增强的 LLM 生成内容，仅作复盘参考，不构成事实保证与投注建议；
   prompt 明确要求"搜不到确凿战报时如实说明，不得编造"，输出文件头部带免责声明。
+  另设材料校验：联网取回的战报材料若出现"虚构/为您撰写/模拟战报"等代写痕迹，判定为不可采信，
+  该场跳过第二阶段、按失败记录（深度归因字段写入失败占位，下游会跳过），绝不当作事实依据。
 """
 import argparse
 import json
@@ -63,6 +65,19 @@ PLAYBOOK_CN = ["胜平负", "让球", "总进球", "半全场", "比分"]
 # 第一步：裸查询（不含指令），实测长指令会导致模型放弃构造搜索词、
 # 受"日期在未来"的内部困惑干扰而直接答"未搜到"；裸查询能稳定触发联网搜索取回真实战报。
 SEARCH_QUERY_TEMPLATE = "{home} {score} {away} {league} 2026年 赛后战报"
+
+# 战报材料可信度校验：模型搜不到真实战报时，会把"虚构/代写"的战报当作搜索结果返回
+# （实测 2026-10-26 材料原文含"这是一场虚构的未来赛事……为您撰写一份详尽的赛后战报"）。
+# 命中下列任一表述即判定材料不可采信，该场按失败处理，绝不作为事实依据进入归因。
+FABRICATION_MARKERS = [
+    "虚构",
+    "为您撰写",
+    "为你撰写",
+    "模拟战报",
+    "示例战报",
+    "以下为模拟",
+    "假设的比赛",
+]
 
 ATTRIBUTION_TEMPLATE = """你是竞彩足球复盘专家。以下是这场比赛的预测失败情况，以及通过联网搜索取回的赛后战报材料。
 
@@ -136,6 +151,18 @@ def split_teams(duizhen):
     home = parts[0].strip() if parts else ""
     away = parts[-1].strip() if len(parts) > 1 else ""
     return home, away
+
+
+def detect_fabricated_material(material):
+    """判断联网取回的战报材料是否为模型虚构/代写。返回 (是否虚构, 命中词)。
+
+    命中任一 FABRICATION_MARKERS 即视为不可采信；空材料不算虚构（由调用方按"未取回"处理）。
+    """
+    text = material or ""
+    for marker in FABRICATION_MARKERS:
+        if marker in text:
+            return True, marker
+    return False, ""
 
 
 def build_search_query(match, date_str):
@@ -242,6 +269,8 @@ def build_txt(report):
     lines.append(f"深度归因对照报告 - {report['复盘日期']}")
     lines.append(f"生成时间：{report['生成时间']}  提供方：{report['provider']}  模型：{report['model']}")
     lines.append(f"错题场数：{report['错题总数']}（深度归因成功 {report['成功数']} / 失败 {report['失败数']}）")
+    if report.get("材料疑似虚构场次"):
+        lines.append(f"材料校验：{report['材料疑似虚构场次']} 场战报材料疑似虚构，已按失败处理、未作为事实依据（原文见 JSON）")
     lines.append("说明：深度归因为联网搜索增强的 LLM 生成内容，仅作复盘参考，不构成事实保证与投注建议。")
     lines.append("=" * 60)
     for m in report["场次"]:
@@ -249,7 +278,9 @@ def build_txt(report):
         lines.append(f"  错误玩法：{'、'.join(m['错误玩法'])}")
         lines.append(f"  【原归因】{m['原错误归因'] or '（无）'}")
         material = m.get("战报材料")
-        if material:
+        if str(m.get("材料校验", "")).startswith("疑似虚构"):
+            lines.append(f"  【战报材料·{m['材料校验']}】未采用，原文见 JSON")
+        elif material:
             lines.append(f"  【战报材料·联网搜索】{material[:600]}{'…' if len(material) > 600 else ''}")
         else:
             lines.append("  【战报材料·联网搜索】（未取回）")
@@ -311,30 +342,44 @@ def main():
     refuse_if_exists([out_json, out_txt])
 
     entries = []
-    n_ok = n_fail = 0
+    n_ok = n_fail = n_suspicious = 0
     for i, (m, wrong) in enumerate(failed, 1):
         num = m.get("编号", "")
         home_away = m.get("对阵", "")
         query = build_search_query(m, date_str)
         print(f"\n[{i}/{len(failed)}] 🔍 {num} {home_away}")
         print(f"  搜索查询：{query}")
+        material_issue = ""
         try:
             material, refs = call_web_llm(args.provider, model, api_key, query)
-            print(f"  ✅ 战报材料取回（{len(material)} 字）")
+            fabricated, marker = detect_fabricated_material(material)
+            if fabricated:
+                material_issue = f"疑似虚构（命中「{marker}」）"
+                print(f"  ❌ 战报材料{material_issue}，不采用")
+            else:
+                print(f"  ✅ 战报材料取回（{len(material)} 字）")
         except Exception as e:
             material, refs = None, []
             print(f"  ⚠️ 战报搜索失败：{e}（将以无材料继续归因）")
-        try:
-            content, _ = call_plain_llm(
-                args.provider, model, api_key,
-                build_attribution_prompt(m, wrong, date_str, material),
-            )
-            n_ok += 1
-            print(f"  ✅ 深度归因完成（{len(content)} 字）")
-        except Exception as e:
+
+        if material_issue:
+            # 材料不可采信时不再生成归因，按失败记录，绝不把虚构战报当事实依据
             n_fail += 1
-            content = f"(深度归因调用失败：{e})"
-            print(f"  ❌ 归因失败：{e}")
+            n_suspicious += 1
+            content = f"(深度归因调用失败：战报材料{material_issue}，未采用以免误导)"
+            print("  ⏭️ 跳过归因（材料不可采信）")
+        else:
+            try:
+                content, _ = call_plain_llm(
+                    args.provider, model, api_key,
+                    build_attribution_prompt(m, wrong, date_str, material),
+                )
+                n_ok += 1
+                print(f"  ✅ 深度归因完成（{len(content)} 字）")
+            except Exception as e:
+                n_fail += 1
+                content = f"(深度归因调用失败：{e})"
+                print(f"  ❌ 归因失败：{e}")
         entries.append({
             "编号": num,
             "联赛": m.get("联赛", ""),
@@ -343,6 +388,7 @@ def main():
             "错误玩法": list(wrong),
             "搜索查询": query,
             "战报材料": material,
+            "材料校验": material_issue or ("通过" if material else "未取回"),
             "原错误归因": m.get("错误归因", ""),
             "深度归因": content,
             "搜索引用": refs,
@@ -358,6 +404,7 @@ def main():
         "错题总数": len(failed),
         "成功数": n_ok,
         "失败数": n_fail,
+        "材料疑似虚构场次": n_suspicious,
         "场次": entries,
     }
 
@@ -368,7 +415,8 @@ def main():
         f.write(build_txt(report) + "\n")
 
     print(f"\n{'='*60}")
-    print(f"  完成：成功 {n_ok} / 失败 {n_fail}")
+    print(f"  完成：成功 {n_ok} / 失败 {n_fail}"
+          + (f"（其中战报材料疑似虚构 {n_suspicious} 场，未采用）" if n_suspicious else ""))
     print(f"  输出：{out_json}")
     print(f"        {out_txt}")
     if n_fail:

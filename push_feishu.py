@@ -409,26 +409,33 @@ def build_attribution_cards(attr_date, attr, review_stats):
     return payloads
 
 
-def push_attribution_group(review_stats):
-    """推送昨日深度归因到独立群。可选增强：任何失败只打印提示，绝不抛错影响主流程。"""
-    yesterday_str = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+def push_attribution_group(review_stats, review_date=""):
+    """推送与本次已推送复盘同一天的深度归因到独立群。
+
+    归因日期必须跟随实际推送出去的复盘日期（load_yesterday_review 找不到昨日复盘时
+    会回退到最新一份，此时若仍按“昨日”取归因，就会出现“有复盘、无归因”的错配）。
+    复盘日期为空时退回昨日，保持原有行为。
+
+    可选增强：任何失败只打印提示，绝不抛错影响主流程。
+    """
+    attr_date = review_date or (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     webhook = os.environ.get("FEISHU_ATTR_WEBHOOK", "").strip()
     if not webhook:
         print("ℹ️ 未设置 FEISHU_ATTR_WEBHOOK，深度归因不推送独立群（配置后自动启用）")
         return
-    attr = load_attribution(yesterday_str)
+    attr = load_attribution(attr_date)
     if not attr:
-        print(f"ℹ️ 无 output/深度归因_{yesterday_str}.json，跳过独立群推送")
+        print(f"ℹ️ 无 output/深度归因_{attr_date}.json，跳过独立群推送")
         return
     if not attr.get("场次"):
-        print(f"ℹ️ 深度归因 {yesterday_str} 无错题场次，跳过独立群推送")
+        print(f"ℹ️ 深度归因 {attr_date} 无错题场次，跳过独立群推送")
         return
-    marker = os.path.join(OUTPUT_DIR, f"深度归因_{yesterday_str}.pushed")
+    marker = os.path.join(OUTPUT_DIR, f"深度归因_{attr_date}.pushed")
     if os.path.exists(marker):
-        print(f"ℹ️ 深度归因 {yesterday_str} 已推送过独立群（标记文件存在），跳过")
+        print(f"ℹ️ 深度归因 {attr_date} 已推送过独立群（标记文件存在），跳过")
         return
 
-    payloads = build_attribution_cards(yesterday_str, attr, review_stats)
+    payloads = build_attribution_cards(attr_date, attr, review_stats)
     print(f"准备推送深度归因到独立群：{len(payloads)} 张卡片（Webhook: ...{webhook[-12:]}）")
     for i, dp in enumerate(payloads, 1):
         if not send(webhook, dp, label=f"深度归因 {i}/{len(payloads)}"):
@@ -498,7 +505,7 @@ def main():
 
     # 深度归因独立群推送（可选增强，任何异常不影响以上主流程）
     try:
-        push_attribution_group(review_stats)
+        push_attribution_group(review_stats, review_date)
     except Exception as e:
         print(f"⚠️ 深度归因独立群推送异常（不影响主流程）：{e}")
 

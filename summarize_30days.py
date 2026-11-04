@@ -4,11 +4,20 @@
 读取 4 张模拟盘 CSV（模拟30 / 竞彩总进球 / 竞彩半全场 / 竞彩比分），
 纯 Python 客观计算，生成 30天数据汇总报告.md。不调用任何大模型。
 
+用法：
+  python3 summarize_30days.py                      # 读项目根目录 4 张表 → 30天数据汇总报告.md
+  python3 summarize_30days.py --input-dir DIR --out PATH   # 读修复重算输出目录 → 指定报告
+
 结算口径（源自各表 tracker 的既有规则，报告中原样说明）：
 - 模拟30：每场让球单注 100，让球命中=是 → 盈亏=100×(赔率-1)，否 → -100；
   胜平负仅记录命中、未实投，其"盈亏"为等额 100 按赔率的虚拟结算，报告中明确标注。
-- 其余三表：每场 100 等额分摊到各预测选项，盈亏为表内"模拟盈亏"列原值。
+- 其余三表：每场 100 等额分摊到各实际预测选项（选项数≠3 时按实际数量均分），
+  盈亏为表内"模拟盈亏"列原值。
+- 记录状态列（审计修复后新增）：命中/未中计入命中率分母；无预测输出/未结算/
+  数据缺失/赔率数量异常/含非法编码 不计分母、不计盈亏；赔率缺失（已判定命中但无赔率）
+  计入命中率，不计投注额与盈亏，单列统计。
 """
+import argparse
 import csv
 import glob
 import os
@@ -16,7 +25,6 @@ import re
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OUT_PATH = os.path.join(ROOT, "30天数据汇总报告.md")
 
 MAIN_CSV = "模拟30.csv"
 PLAY_CSVS = {
@@ -26,9 +34,16 @@ PLAY_CSVS = {
 }
 STAKE = 100.0
 
+# 审计修复后 tracker 写入的记录状态（settle_core.py）
+SETTLED_STATUSES = ("命中", "未中")
+EXCLUDED_STATUSES = ("无预测输出", "未结算", "数据缺失", "赔率缺失", "赔率数量异常", "含非法编码")
+
+INPUT_DIR = ROOT
+OUT_PATH = os.path.join(ROOT, "30天数据汇总报告.md")
+
 
 def read_csv(name):
-    with open(os.path.join(ROOT, name), encoding="utf-8-sig", newline="") as f:
+    with open(os.path.join(INPUT_DIR, name), encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
 
 
@@ -58,6 +73,15 @@ def money(x):
     return "—" if x is None else f"{x:+.2f}".rstrip("0").rstrip(".")
 
 
+def _status_of(r, hit_key):
+    """取记录状态列；旧表无该列时按命中列回退推断（命中/未中/未结算）。"""
+    st = (r.get("记录状态") or "").strip()
+    if st:
+        return st
+    h = hit3(r.get(hit_key))
+    return "命中" if h is True else "未中" if h is False else "未结算"
+
+
 def load_main():
     """主表：一行一场，让球实投 + 胜平负虚拟。"""
     rows = []
@@ -65,11 +89,13 @@ def load_main():
         odds_h, odds_w = to_f(r.get("让球赔率")), to_f(r.get("胜平负赔率"))
         h_hcp, h_wdl = hit3(r.get("让球命中")), hit3(r.get("胜平负命中"))
         pl_hcp = to_f(r.get("模拟盈亏"))
-        # 胜平负虚拟结算：等额 100 按赔率
+        # 胜平负虚拟结算：等额 100 按赔率。未中不看赔率（缺赔率也应计 -100）
         pl_wdl = None
-        if h_wdl is not None and odds_w is not None:
-            pl_wdl = round(STAKE * (odds_w - 1), 2) if h_wdl else -STAKE
-        # 胜平负虚拟口径下，让球命中是否结算不影响该虚拟列；但未开奖场（让球未结算）排除
+        if h_wdl is True and odds_w is not None:
+            pl_wdl = round(STAKE * (odds_w - 1), 2)
+        elif h_wdl is False:
+            pl_wdl = -STAKE
+        # 已结算 = 让球命中列有有效三态值（无预测输出/未结算/数据缺失均不算）
         settled = h_hcp is not None
         rows.append({
             "日期": r["日期"], "编号": r["编号"], "联赛": r["联赛"],
@@ -77,6 +103,7 @@ def load_main():
             "hcp_hit": h_hcp, "hcp_pl": pl_hcp, "hcp_settled": settled,
             "wdl_hit": h_wdl, "wdl_pl": pl_wdl,
             "归因": (r.get("错题标签(归因)") or "").strip(),
+            "状态": _status_of(r, "让球命中"),
         })
     return rows
 
@@ -91,14 +118,16 @@ def load_play(name, fname):
             "日期": r["日期"], "编号": r["编号"], "联赛": r["联赛"],
             "信心": (r.get("信心指数") or "").strip(),
             "hit": h, "pl": pl, "settled": h is not None,
+            "状态": _status_of(r, "是否命中"),
         })
     return rows
 
 
 def overall_block():
     lines = ["## 一、整体盈亏（4 张表）", ""]
-    lines.append("| 表 | 场次 | 已结算 | 未开奖 | 总投入 | 总盈亏 | 回报率 |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| 表 | 场次 | 已结算 | 未计盈亏 | 总投入 | 总返奖 | 总盈亏 | 回报率 |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    totals = {"inv": 0.0, "pl": 0.0}
     for label, rows, pl_key, st_key in [
         ("模拟30（让球实投）", main_rows, "hcp_pl", "hcp_settled"),
         ("竞彩总进球", play_rows["总进球"], "pl", "settled"),
@@ -106,12 +135,66 @@ def overall_block():
         ("竞彩比分", play_rows["比分"], "pl", "settled"),
     ]:
         settled = [r for r in rows if r[st_key]]
-        inv = sum(STAKE for r in settled)
-        pl = sum(r[pl_key] or 0 for r in settled)
+        paids = [r for r in settled if r[pl_key] is not None]
+        inv = sum(STAKE for r in paids)
+        pl = sum(r[pl_key] for r in paids)
         roi = pl / inv if inv else None
-        lines.append(f"| {label} | {len(rows)} | {len(settled)} | {len(rows)-len(settled)} | {inv:.0f} | {money(pl)} | {pct(roi)} |")
+        totals["inv"] += inv
+        totals["pl"] += pl
+        lines.append(f"| {label} | {len(rows)} | {len(settled)} | {len(rows)-len(settled)} | {inv:.0f} "
+                     f"| {money(inv + pl)} | {money(pl)} | {pct(roi)} |")
+    roi_all = totals["pl"] / totals["inv"] if totals["inv"] else None
+    lines.append(f"| **合计** | — | — | — | {totals['inv']:.0f} | {money(totals['inv'] + totals['pl'])} "
+                 f"| {money(totals['pl'])} | {pct(roi_all)} |")
     lines.append("")
-    lines.append("> 口径：每场模拟投注 100；模拟30 实投玩法为让球（胜平负未实投，其盈亏见下方虚拟口径）；其余三表盈亏取表内原值。回报率 = 总盈亏 ÷ 总投入。")
+    lines.append("> 公式：总投入 = 参与结算且有盈亏的场次 × 100；总返奖 = 总投入 + 总盈亏（体彩赔率含本金）；"
+                 "净盈亏 = 命中选项赔率 × 单项投注 - 该场总投入；全未中 = -该场总投入；ROI = 净盈亏 ÷ 总投入。")
+    lines.append("> 口径：模拟30 实投玩法为让球（胜平负未实投，其盈亏为虚拟口径）；三张多选表每场 100 为总预算，按实际合法选项数均分；"
+                 "命中但赔率缺失的场次计入命中率、不计入投入与盈亏。")
+    lines.append("")
+    return lines
+
+
+def status_block():
+    """记录状态分布与守恒校验；单列"无输出执行损失"口径。"""
+    lines = ["## 一·五、记录状态分布（审计修复口径）", ""]
+    lines.append("| 表 | 命中 | 未中 | 无预测输出 | 未结算 | 数据缺失 | 赔率缺失 | 赔率数量异常 | 含非法编码 | 合计 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    all_ok = True
+    for label, rows, pl_key, st_key in [
+        ("模拟30（让球实投）", main_rows, "hcp_pl", "hcp_settled"),
+        ("竞彩总进球", play_rows["总进球"], "pl", "settled"),
+        ("竞彩半全场", play_rows["半全场"], "pl", "settled"),
+        ("竞彩比分", play_rows["比分"], "pl", "settled"),
+    ]:
+        c = Counter(r["状态"] for r in rows)
+        total = sum(c.values())
+        settled_n = sum(1 for r in rows if r[st_key])
+        # 守恒：状态计数 = 行数；命中+未中+赔率缺失 = 已结算；按联赛分组求和 = 总体盈亏
+        by_league = defaultdict(float)
+        by_league_n = Counter()
+        for r in rows:
+            by_league_n[r["联赛"]] += 1
+            if r[st_key]:
+                by_league[r["联赛"]] += r[pl_key] or 0
+        ok = (total == len(rows)
+              and c["命中"] + c["未中"] + c["赔率缺失"] == settled_n
+              and sum(by_league_n.values()) == len(rows)
+              and abs(sum(by_league.values()) - sum(r[pl_key] or 0 for r in rows if r[st_key])) < 0.005)
+        all_ok = all_ok and ok
+        lines.append(
+            f"| {label} | {c['命中']} | {c['未中']} | {c['无预测输出']} | {c['未结算']} "
+            f"| {c['数据缺失']} | {c['赔率缺失']} | {c['赔率数量异常']} | {c['含非法编码']} | {total} |")
+    lines.append("")
+    # 无输出执行损失：旧口径把无预测输出当未中各记 -100，修复后不计盈亏
+    n_nopred = sum(1 for rows in [play_rows["总进球"], play_rows["半全场"], play_rows["比分"]]
+                   for r in rows if r["状态"] == "无预测输出")
+    n_nopred_main = sum(1 for r in main_rows if r["状态"] == "无预测输出")
+    avoided = STAKE * (n_nopred + n_nopred_main)
+    lines.append(f"- 无预测输出合计：{n_nopred + n_nopred_main} 场（模拟30 让球 {n_nopred_main} 场 + 三玩法表 {n_nopred} 场）。")
+    lines.append(f"- 无输出执行损失口径：修复前这些场次被按「未中 -{STAKE:.0f}」计入盈亏，"
+                 f"修复后不计入，避免虚增亏损 {avoided:.0f} 元。")
+    lines.append(f"- 守恒校验：各表状态计数合计 = 表行数，{'全部通过' if all_ok else '存在不一致，请检查'}。")
     lines.append("")
     return lines
 
@@ -124,8 +207,8 @@ def conf_block():
         return "9+" if (v.isdigit() and int(v) >= 9) else (v if v in buckets else "")
 
     acc = defaultdict(lambda: {
-        "hcp": Counter(), "hcp_pl": 0.0,
-        "wdl": Counter(), "wdl_pl": 0.0, "n": 0})
+        "hcp": Counter(), "hcp_pl": 0.0, "hcp_n": 0,
+        "wdl": Counter(), "wdl_pl": 0.0, "wdl_n": 0, "n": 0})
     for r in main_rows:
         b = bk(r["信心"])
         if not b:
@@ -134,10 +217,14 @@ def conf_block():
         a["n"] += 1
         if r["hcp_settled"]:
             a["hcp"][r["hcp_hit"]] += 1
-            a["hcp_pl"] += r["hcp_pl"] or 0
+            if r["hcp_pl"] is not None:
+                a["hcp_pl"] += r["hcp_pl"]
+                a["hcp_n"] += 1
         if r["wdl_hit"] is not None:
             a["wdl"][r["wdl_hit"]] += 1
-            a["wdl_pl"] += r["wdl_pl"] or 0
+            if r["wdl_pl"] is not None:
+                a["wdl_pl"] += r["wdl_pl"]
+                a["wdl_n"] += 1
 
     lines.append("### 让球（实投口径）")
     lines.append("")
@@ -147,7 +234,7 @@ def conf_block():
         if b not in acc:
             continue
         a = acc[b]
-        inv = STAKE * (a["hcp"][True] + a["hcp"][False])
+        inv = STAKE * a["hcp_n"]
         roi = a["hcp_pl"] / inv if inv else None
         lines.append(f"| {b} 分 | {a['n']} | {a['hcp'][True]} | {a['hcp'][False]} | {pct(rate(a['hcp']))} | {money(a['hcp_pl'])} | {pct(roi)} |")
     unk = sum(1 for r in main_rows if bk(r["信心"]) == "")
@@ -163,7 +250,7 @@ def conf_block():
         if b not in acc:
             continue
         a = acc[b]
-        inv = STAKE * (a["wdl"][True] + a["wdl"][False])
+        inv = STAKE * a["wdl_n"]
         roi = a["wdl_pl"] / inv if inv else None
         lines.append(f"| {b} 分 | {a['n']} | {a['wdl'][True]} | {a['wdl'][False]} | {pct(rate(a['wdl']))} | {money(a['wdl_pl'])} | {pct(roi)} |")
     lines.append("")
@@ -174,14 +261,16 @@ def conf_block():
 
 def league_block():
     lines = ["## 三、联赛红黑榜（让球实投口径）", ""]
-    acc = defaultdict(lambda: {"hit": Counter(), "pl": 0.0, "n": 0})
+    acc = defaultdict(lambda: {"hit": Counter(), "pl": 0.0, "n": 0, "n_paid": 0})
     for r in main_rows:
         if not r["hcp_settled"]:
             continue
         a = acc[r["联赛"]]
         a["n"] += 1
         a["hit"][r["hcp_hit"]] += 1
-        a["pl"] += r["hcp_pl"] or 0
+        if r["hcp_pl"] is not None:
+            a["n_paid"] += 1
+            a["pl"] += r["hcp_pl"]
     stat = sorted(
         ((lg, v) for lg, v in acc.items()),
         key=lambda kv: (kv[1]["pl"], rate(kv[1]["hit"]) or 0), reverse=True)
@@ -189,7 +278,7 @@ def league_block():
     lines.append("")
 
     def row(lg, v):
-        inv = STAKE * (v["hit"][True] + v["hit"][False])
+        inv = STAKE * v["n_paid"]
         return (f"| {lg} | {v['n']} | {v['hit'][True]} | {pct(rate(v['hit']))} "
                 f"| {money(v['pl'])} | {pct(v['pl'] / inv if inv else None)} |")
 
@@ -228,7 +317,7 @@ def play_block():
         settled = [r for r in rows if r[hit_key] is not None and (label in ("让球", "胜平负") or r["settled"])]
         hits = Counter(r[hit_key] for r in settled)
         pl = sum(r[pl_key] or 0 for r in settled)
-        inv = STAKE * len(settled)
+        inv = STAKE * sum(1 for r in settled if r[pl_key] is not None)
         stat.append((label, len(rows), len(settled), hits[True], rate(hits), pl, pl / inv if inv else None))
         mark = "虚拟" if label == "胜平负" else "实投"
         lines.append(f"| {label} | {mark} | {len(rows)} | {len(settled)} | {hits[True]} | {pct(rate(hits))} | {money(pl)} | {pct(pl / inv if inv else None)} |")
@@ -240,6 +329,9 @@ def play_block():
     lines.append(f"- 实投玩法中**盈亏最差**：{worst_pl[0]}（{money(worst_pl[5])}）。")
     lines.append("")
     lines.append("> 胜平负为虚拟口径，未纳入「实投红黑榜」结论，仅供对比。")
+    miss_odds_wdl = sum(1 for r in main_rows if r["wdl_hit"] is True and r["wdl_pl"] is None)
+    if miss_odds_wdl:
+        lines.append(f"> 胜平负另有 {miss_odds_wdl} 场判定为命中但赔率缺失：计入命中率，不计入投入与盈亏（详见五种玩法逐场结果的「赔率缺失」状态）。")
     lines.append("")
     return lines
 
@@ -296,16 +388,25 @@ def keyword_block():
 
 
 def main():
-    global main_rows, play_rows
+    global main_rows, play_rows, INPUT_DIR, OUT_PATH
+    ap = argparse.ArgumentParser(description="30 天模拟盘汇总统计")
+    ap.add_argument("--input-dir", default=ROOT, help="4 张模拟盘 CSV 所在目录（默认项目根目录）")
+    ap.add_argument("--out", default=None, help="报告输出路径（默认 <input-dir>/30天数据汇总报告.md）")
+    args = ap.parse_args()
+    INPUT_DIR = args.input_dir
+    OUT_PATH = args.out or os.path.join(INPUT_DIR, "30天数据汇总报告.md")
+
     main_rows = load_main()
     play_rows = {name: load_play(name, fname) for name, fname in PLAY_CSVS.items()}
 
     report = ["# 30 天模拟盘数据汇总报告", ""]
     dates = sorted({r["日期"] for r in main_rows})
     report.append(f"- 数据范围：{dates[0]} ~ {dates[-1]}，共 {len(dates)} 个销售日、{len(main_rows)} 场（模拟30 口径）。")
+    report.append(f"- 数据来源目录：{INPUT_DIR}")
     report.append("- 生成方式：summarize_30days.py 纯 Python 客观统计，无大模型参与。")
     report.append("")
     report.extend(overall_block())
+    report.extend(status_block())
     report.extend(conf_block())
     report.extend(league_block())
     report.extend(play_block())
