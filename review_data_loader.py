@@ -81,6 +81,11 @@ def load_review_data(date_str, output_dir="output"):
         actual = item.get("赛果", {}) or {}
         hit = item.get("命中", {}) or {}
 
+        # 三态命中：True/False/None（None = 无预测输出，不得按 False 处理）
+        def _tri(key):
+            v = hit.get(key)
+            return v if v is None else bool(v)
+
         result[num] = {
             "全场": actual.get("全场", ""),
             "半场": actual.get("半场", ""),
@@ -89,11 +94,11 @@ def load_review_data(date_str, output_dir="output"):
             "总进球": actual.get("总进球", ""),
             "半全场": actual.get("半全场", ""),
             "比分": actual.get("比分", ""),
-            "hit_spf": bool(hit.get("胜平负", False)),
-            "hit_rq": bool(hit.get("让球", False)),
-            "hit_ttg": bool(hit.get("总进球", False)),
-            "hit_hafu": bool(hit.get("半全场", False)),
-            "hit_crs": bool(hit.get("比分", False)),
+            "hit_spf": _tri("胜平负"),
+            "hit_rq": _tri("让球"),
+            "hit_ttg": _tri("总进球"),
+            "hit_hafu": _tri("半全场"),
+            "hit_crs": _tri("比分"),
             "归因": item.get("错误归因"),
         }
 

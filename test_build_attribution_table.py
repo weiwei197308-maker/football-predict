@@ -21,16 +21,20 @@ from build_attribution_table import (
 
 
 def _record(num, hits, old_attr="旧归因文本", pred=None, actual=None):
+    """构造一条每日记录。默认 预判/赛果 一致（五玩法全命中），便于只改需要错的玩法。"""
     return {
         "编号": num,
         "联赛": "测试联赛",
         "对阵": "A队 vs B队",
         "信心指数": 5,
         "预判": pred or {"胜平负": "主胜", "让球": "让-1主胜", "总进球": "2球", "半全场": "HH", "比分": "2:0"},
-        "赛果": actual or {"胜平负": "客胜", "让球": "客胜", "总进球": "1球", "半全场": "AA", "比分": "0:1"},
+        "赛果": actual or {"胜平负": "主胜", "让球": "主胜", "总进球": "2球", "半全场": "HH", "比分": "2:0"},
         "命中": hits,
         "错误归因": old_attr,
     }
+
+
+MISS_ALL_ACTUAL = {"胜平负": "客胜", "让球": "客胜", "总进球": "1球", "半全场": "AA", "比分": "0:1"}
 
 
 def _write_record(tmpdir, date_str, matches):
@@ -53,7 +57,7 @@ DEEP_TEXT = (
 
 
 class TestWrongDetection(unittest.TestCase):
-    """错题识别：命中 v is False 严格口径"""
+    """错题识别：从 预判/赛果 用规范判定函数重算，仅 False 产行"""
 
     def test_hit_true_no_row(self):
         with tempfile.TemporaryDirectory() as d:
@@ -64,7 +68,8 @@ class TestWrongDetection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             hits = {p: True for p in PLAYBOOKS}
             hits["让球"] = False
-            _write_record(d, "2026-01-01", [_record("测试001", hits)])
+            actual = {"胜平负": "主胜", "让球": "客胜", "总进球": "2球", "半全场": "HH", "比分": "2:0"}
+            _write_record(d, "2026-01-01", [_record("测试001", hits, actual=actual)])
             rows = build_rows(d)
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0][4], "让球")
@@ -74,13 +79,40 @@ class TestWrongDetection(unittest.TestCase):
             hits = {p: True for p in PLAYBOOKS}
             for p in ("让球", "总进球", "比分"):
                 hits[p] = False
-            _write_record(d, "2026-01-01", [_record("测试001", hits)])
+            actual = {"胜平负": "主胜", "让球": "客胜", "总进球": "1球", "半全场": "HH", "比分": "0:1"}
+            _write_record(d, "2026-01-01", [_record("测试001", hits, actual=actual)])
             rows = build_rows(d)
             self.assertEqual(len(rows), 3)
             self.assertEqual([r[4] for r in rows], ["让球", "总进球", "比分"])  # 按玩法枚举顺序
 
-    def test_missing_hit_key_no_row(self):
-        """命中 key 缺失不产行（与 tracker 的 bool(get) 口径不同）"""
+    def test_stale_hit_flag_ignored_when_now_hit(self):
+        """审计回归（问题 A）：历史 JSON 写成 False，但按规范判定已命中 → 不得进错题表。
+
+        取 10-11 真实样例：中文半全场 '半平-全客胜 / 半客胜-全客胜 / 半平-全平'，实际 DA。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            pred = {"胜平负": "主胜", "让球": "让-1主胜", "总进球": "2球",
+                    "半全场": "半平-全客胜 / 半客胜-全客胜 / 半平-全平", "比分": "2:0"}
+            actual = {"胜平负": "主胜", "让球": "主胜", "总进球": "2球", "半全场": "DA", "比分": "2:0"}
+            hits = {p: True for p in PLAYBOOKS}
+            hits["半全场"] = False          # 陈旧判定
+            _write_record(d, "2026-01-01", [_record("测试001", hits, pred=pred, actual=actual)])
+            self.assertEqual(build_rows(d), [])
+
+    def test_invalid_code_no_row(self):
+        """审计回归（问题 D）：10-10 周六003 半全场 'HH / HP / DH'，实际 AA。
+
+        HP 为非法编码，不能映射也不能当成模型预测错误 → 不产错题行。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            pred = {"胜平负": "主胜", "让球": "让-1主胜", "总进球": "2球",
+                    "半全场": "HH / HP / DH", "比分": "2:0"}
+            actual = {"胜平负": "主胜", "让球": "主胜", "总进球": "2球", "半全场": "AA", "比分": "2:0"}
+            _write_record(d, "2026-01-01", [_record("测试001", {p: True for p in PLAYBOOKS}, pred=pred, actual=actual)])
+            self.assertEqual(build_rows(d), [])
+
+    def test_hit_key_missing_still_judged(self):
+        """命中 key 缺失不再影响判定：改用 预判/赛果 重算。"""
         with tempfile.TemporaryDirectory() as d:
             hits = {p: True for p in PLAYBOOKS}
             del hits["让球"]  # key 缺失
@@ -94,14 +126,34 @@ class TestWrongDetection(unittest.TestCase):
             _write_record(d, "2026-01-01", [_record("测试001", hits)])
             self.assertEqual(build_rows(d), [])
 
+    def test_empty_pred_no_row(self):
+        """审计修复回归：预判字段为空 = 无预测输出，即使历史 JSON 写成 False 也不进错题表。
+
+        对应审计问题 C：09-30 周三001/002 五玩法预判全空被当错题、
+        周四014/周日013 仅半全场预判空被当半全场错题。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            hits = {p: True for p in PLAYBOOKS}
+            hits["半全场"] = False
+            pred = {"胜平负": "主胜", "让球": "让-1主胜", "总进球": "2球", "半全场": "", "比分": "2:0"}
+            _write_record(d, "2026-01-01", [_record("测试001", hits, pred=pred)])
+            self.assertEqual(build_rows(d), [])
+
+    def test_all_pred_empty_no_row(self):
+        """五玩法预判全空 + 命中全 False（09-30 周三001/002 情形）→ 一行都不产。"""
+        with tempfile.TemporaryDirectory() as d:
+            hits = {p: False for p in PLAYBOOKS}
+            pred = {p: "" for p in PLAYBOOKS}
+            _write_record(d, "2026-01-01", [_record("测试001", hits, pred=pred)])
+            self.assertEqual(build_rows(d), [])
+
 
 class TestSourceSelection(unittest.TestCase):
     """归因来源判定与安全降级"""
 
     def _setup(self, tmpdir, deep_entries=None):
-        hits = {p: True for p in PLAYBOOKS}
-        hits["让球"] = False
-        _write_record(tmpdir, "2026-01-01", [_record("测试001", hits, old_attr="AI高估了主队")])
+        actual = {"胜平负": "主胜", "让球": "客胜", "总进球": "2球", "半全场": "HH", "比分": "2:0"}
+        _write_record(tmpdir, "2026-01-01", [_record("测试001", {}, old_attr="AI高估了主队", actual=actual)])
         if deep_entries is not None:
             _write_deep(tmpdir, "2026-01-01", deep_entries)
 
@@ -168,9 +220,8 @@ class TestSummary(unittest.TestCase):
     def test_deep_summary_from_section_only(self):
         """深度来源摘要必须来自【失败根因】段，不含其他小节"""
         with tempfile.TemporaryDirectory() as d:
-            hits = {p: True for p in PLAYBOOKS}
-            hits["比分"] = False
-            _write_record(d, "2026-01-01", [_record("测试001", hits)])
+            actual = {"胜平负": "主胜", "让球": "主胜", "总进球": "2球", "半全场": "HH", "比分": "0:1"}
+            _write_record(d, "2026-01-01", [_record("测试001", {}, actual=actual)])
             _write_deep(d, "2026-01-01", [{"编号": "测试001", "深度归因": DEEP_TEXT}])
             rows = build_rows(d)
             summary = rows[0][9]
@@ -211,9 +262,8 @@ class TestClassify(unittest.TestCase):
     def test_classification_scope_deep(self):
         """深度来源分类只匹配【失败根因】段：差异段的'高估'是元描述，不得污染分类"""
         with tempfile.TemporaryDirectory() as d:
-            hits = {p: True for p in PLAYBOOKS}
-            hits["比分"] = False
-            _write_record(d, "2026-01-01", [_record("测试001", hits)])
+            actual = {"胜平负": "主胜", "让球": "主胜", "总进球": "2球", "半全场": "HH", "比分": "0:1"}
+            _write_record(d, "2026-01-01", [_record("测试001", {}, actual=actual)])
             _write_deep(d, "2026-01-01", [{"编号": "测试001", "深度归因": DEEP_TEXT}])
             rows = build_rows(d)
             cause = rows[0][8]
@@ -236,9 +286,8 @@ class TestStructure(unittest.TestCase):
     def test_row_fields_from_record(self):
         """AI预测/实际赛果取每日记录 预判/赛果 对应玩法字段"""
         with tempfile.TemporaryDirectory() as d:
-            hits = {p: True for p in PLAYBOOKS}
-            hits["比分"] = False
-            _write_record(d, "2026-01-01", [_record("测试001", hits)])
+            actual = {"胜平负": "主胜", "让球": "主胜", "总进球": "2球", "半全场": "HH", "比分": "0:1"}
+            _write_record(d, "2026-01-01", [_record("测试001", {}, actual=actual)])
             rows = build_rows(d)
             r = rows[0]
             self.assertEqual(r[0], "2026-01-01")

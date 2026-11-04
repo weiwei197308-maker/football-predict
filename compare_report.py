@@ -20,6 +20,7 @@ from analyze import post_process_prediction
 from lottery_rules import (
     derive_handicap_recommendation,
     parse_hafu_codes,
+    parse_hafu_picks_strict,
     run_consistency_checks,
     parse_net_goal_probabilities_text,
     validate_net_goal_probabilities,
@@ -91,6 +92,22 @@ def rq_direction(rec):
     return None
 
 
+def _hafu_hit(codes, invalids, actual_code):
+    """半全场三态判定，与 review.check_hafu、build_attribution_table 口径一致。
+
+    - 预测含任一非法编码（invalids 非空）或为空：整条预测无效 → None，
+      不得把非法项过滤后继续判定；
+    - 实际赛果未知（长度非 2 或含 "?"）：不可判定 → None，不进命中率分母；
+    - 合法预测且命中 → True；合法预测且未命中 → False。
+    """
+    actual = str(actual_code or "").strip().upper()
+    if len(actual) != 2 or "?" in actual:
+        return None
+    if not codes or invalids:
+        return None
+    return actual in codes
+
+
 def row_to_prediction(row):
     """把竞彩分析 CSV 的一行还原成 post_process_prediction 的输入 dict。"""
     pred = {
@@ -147,8 +164,14 @@ def build_match_comparison(row, actual=None):
     rq_changed = rq_before != rq_after
 
     # --- 半全场 ---
-    hafu_before = parse_hafu_codes(split_rec(original.get("半全场推荐")))
+    # 展示用列表沿用原口径；严格解析额外产出非法项，供命中判定使用（非法项不得被过滤后继续判定）。
+    hafu_before, hafu_before_invalids = parse_hafu_picks_strict(
+        split_rec(original.get("半全场推荐"))
+    )
     hafu_after = [str(x).strip() for x in corrected.get("半全场推荐", []) if str(x).strip()]
+    hafu_after_codes, hafu_after_invalids = parse_hafu_picks_strict(
+        corrected.get("半全场推荐", [])
+    )
     hafu_removed = [c for c in hafu_before if c not in hafu_after]
     hafu_added = [c for c in hafu_after if c not in hafu_before]
     hafu_changed = hafu_before != hafu_after
@@ -231,8 +254,8 @@ def build_match_comparison(row, actual=None):
                 "修正后": (rq_direction(rq_after) == actual_rq) if (rq_direction(rq_after) and actual_rq) else None,
             },
             "半全场": {
-                "修正前": (actual_hafu in hafu_before) if actual_hafu else None,
-                "修正后": (actual_hafu in hafu_after) if actual_hafu else None,
+                "修正前": _hafu_hit(hafu_before, hafu_before_invalids, actual_hafu),
+                "修正后": _hafu_hit(hafu_after_codes, hafu_after_invalids, actual_hafu),
             },
             "总进球": {
                 "修正前": (actual_ttg[0] in ttg_before) if actual_ttg else None,
@@ -397,9 +420,13 @@ def build_snapshot_comparison(row, entry, actual=None):
     else:
         rq_cause = "无法归因"
 
-    # ---- 半全场（中文与 HDA 等价规范化后比较） ----
-    hafu_before = parse_hafu_codes(_snapshot_list(original.get("半全场推荐")))
-    hafu_after = parse_hafu_codes(split_rec(row.get("半全场推荐")))
+    # ---- 半全场（中文与 HDA 等价规范化后比较；非法项单独留存供命中判定） ----
+    hafu_before, hafu_before_invalids = parse_hafu_picks_strict(
+        _snapshot_list(original.get("半全场推荐"))
+    )
+    hafu_after, hafu_after_invalids = parse_hafu_picks_strict(
+        split_rec(row.get("半全场推荐"))
+    )
     hafu_removed = [c for c in hafu_before if c not in hafu_after]
     hafu_added = [c for c in hafu_after if c not in hafu_before]
     hafu_changed = hafu_before != hafu_after
@@ -511,8 +538,8 @@ def build_snapshot_comparison(row, entry, actual=None):
                 "修正后": (rq_direction(rq_after) == actual_rq) if (rq_direction(rq_after) and actual_rq) else None,
             },
             "半全场": {
-                "修正前": (actual_hafu in hafu_before) if actual_hafu else None,
-                "修正后": (actual_hafu in hafu_after) if actual_hafu else None,
+                "修正前": _hafu_hit(hafu_before, hafu_before_invalids, actual_hafu),
+                "修正后": _hafu_hit(hafu_after, hafu_after_invalids, actual_hafu),
             },
             "总进球": {
                 "修正前": (actual_ttg[0] in ttg_before) if actual_ttg else None,

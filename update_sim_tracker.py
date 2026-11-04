@@ -5,6 +5,11 @@ import os
 from datetime import date
 
 from review_data_loader import load_review_data
+from settle_core import (
+    STATUS_HIT, STATUS_MISS,
+    STATUS_NO_PREDICTION, STATUS_NO_DATA, STATUS_UNSETTLED,
+    STATUS_ODDS_MISSING, STATUS_JUDGEMENT_MISSING,
+)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 TARGET_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "模拟30.csv")
@@ -14,6 +19,7 @@ CSV_HEADER = [
     "AI让球预测", "让球赔率", "AI胜平负预测", "胜平负赔率",
     "实际赛果", "让球命中", "胜平负命中",
     "模拟投注额", "模拟盈亏", "错题标签(归因)",
+    "记录状态", "备注",
 ]
 
 
@@ -107,41 +113,69 @@ def build_row(analysis_row, football_rows, review_data, mmdd):
     spf_hit = ""
     result_display = ""
     pl = ""
-    bet_amount = 100
+    status = ""
+    note = ""
 
     if full_score:
         # 显示 "X-Y (主胜)" 形式
         result_display = f"{full_score} ({actual_spf_label})" if actual_spf_label else full_score
 
-        # 让球命中：直接读 JSON 的判定结果，转 是/否
+        # 让球命中：直接读 JSON 的判定结果，转 是/否；None（无预测）留空
         if hit_rq is True:
             handicap_hit = "是"
         elif hit_rq is False:
             handicap_hit = "否"
-        # hit_rq 可能为 False 之外的状态（如未开奖时 None）→ 留空
 
-        # 胜平负命中：同上
-        if hit_spf is True:
+        # 胜平负命中：同上；但空预测不得沿用历史 JSON 的 False 判定
+        if not spf_reco:
+            spf_hit = ""
+        elif hit_spf is True:
             spf_hit = "是"
         elif hit_spf is False:
             spf_hit = "否"
 
-        # 盈亏：让球单注 100 元，命中按赔率算，未中 -100
-        if handicap_hit == "是" and handicap_odds:
-            try:
-                odds_val = float(handicap_odds)
-                raw = odds_val * bet_amount - bet_amount
-                pl = f"{raw:+.0f}"
-            except ValueError:
-                pl = ""
-        elif handicap_hit == "否":
-            pl = f"-{bet_amount}"
+        if not handicap_reco:
+            # 有赛果但无让球预测输出：不记未中、不计 -100、不进命中率分母
+            # 命中列必须清空（历史 JSON 可能残留旧版 False 判定，不得透出）
+            status, bet_amount = STATUS_NO_PREDICTION, 0
+            handicap_hit = ""
+        elif handicap_hit == "":
+            # 有预测但判定信息缺失（旧数据 hit 为 null/缺失）：不结算，且不与"无预测输出"混记
+            status, bet_amount = STATUS_JUDGEMENT_MISSING, 0
+            note = "JSON命中判定缺失"
+        else:
+            bet_amount = 100
+            # 盈亏：让球单注 100 元（总预算），命中按赔率算（含本金），未中 -100
+            if handicap_hit == "是":
+                status = STATUS_HIT
+                if handicap_odds:
+                    try:
+                        odds_val = float(handicap_odds)
+                        raw = round(odds_val * bet_amount - bet_amount, 2)
+                        pl = f"{raw:+.2f}"
+                    except ValueError:
+                        pl = ""
+                        status = STATUS_ODDS_MISSING
+                else:
+                    status = STATUS_ODDS_MISSING
+            else:
+                status = STATUS_MISS
+                pl = f"{-float(bet_amount):+.2f}"
+        if not spf_reco and full_score:
+            note = (note + "；" if note else "") + "胜平负无预测"
+    else:
+        # 无赛果：有预测→未结算；无预测→数据缺失
+        if handicap_reco or spf_reco:
+            status, bet_amount = STATUS_UNSETTLED, 100
+        else:
+            status, bet_amount = STATUS_NO_DATA, 0
 
     return [
         mmdd, num, league, matchup, confidence,
         handicap_reco, handicap_odds, spf_reco, spf_odds,
         result_display, handicap_hit, spf_hit,
         bet_amount, pl, attribution,
+        status, note,
     ]
 
 

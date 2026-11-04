@@ -234,6 +234,98 @@ class TestBuildMatchComparison(unittest.TestCase):
         self.assertEqual(comp["实际赛果"]["全场"], "1-2")
 
 
+class TestHafuInvalidCodeConsistency(unittest.TestCase):
+    """半全场三态判定：非法编码整条无效、赛果未知不可判定（与 review/归因统一口径）。"""
+
+    def _row(self, mid="周日001", hafu="HH / DH"):
+        return make_row(
+            编号=mid, 胜平负推荐="主胜", 净胜球分布="主胜1",
+            比分推荐="1:0 / 2:1", 让球推荐="让-1平",
+            总进球推荐="1球 / 2球", 半全场推荐=hafu,
+        )
+
+    @staticmethod
+    def _actual(hafu):
+        return {"编号": "周日001", "赛果": {
+            "全场": "1-0", "半场": "0-0", "半全场": hafu, "让球": "平", "总进球": "1球"}}
+
+    def test_valid_prediction_hit(self):
+        comp = build_match_comparison(self._row(), self._actual("HH"))
+        self.assertIs(comp["命中"]["半全场"]["修正前"], True)
+        self.assertIs(comp["命中"]["半全场"]["修正后"], True)
+
+    def test_valid_prediction_miss(self):
+        comp = build_match_comparison(self._row(), self._actual("AA"))
+        self.assertIs(comp["命中"]["半全场"]["修正前"], False)
+        self.assertIs(comp["命中"]["半全场"]["修正后"], False)
+
+    def test_mixed_invalid_hit_valid_item_is_invalid(self):
+        comp = build_match_comparison(self._row(hafu="HH / HP"), self._actual("HH"))
+        # 原始预测含非法编码 HP → 整条无效，不得把 HP 过滤后按 HH 判命中
+        self.assertIsNone(comp["命中"]["半全场"]["修正前"])
+
+    def test_mixed_invalid_miss_valid_item_is_invalid(self):
+        comp = build_match_comparison(self._row(hafu="HH / HP"), self._actual("AA"))
+        self.assertIsNone(comp["命中"]["半全场"]["修正前"])
+
+    def test_mixed_invalid_final_prediction_still_none(self):
+        # 快照口径：最终预测（CSV 行）本身仍含非法编码 → 修正前/修正后均无效
+        row = self._row(hafu="HH / HP")
+        entry = make_snapshot_entry(
+            original={"胜平负推荐": "主胜", "净胜球分布": "主胜1", "让球推荐": "让-1平",
+                      "总进球推荐": ["1球", "2球"], "半全场推荐": ["HH", "HP"],
+                      "比分推荐": ["1:0", "2:1"], "核心剧本": "s"},
+            fixed={"胜平负推荐": "主胜", "让球推荐": "让-1平",
+                   "总进球推荐": ["1球", "2球"], "半全场推荐": ["HH", "HP"],
+                   "比分推荐": ["1:0", "2:1"]},
+        )
+        for actual_code in ("HH", "AA"):
+            with self.subTest(actual=actual_code):
+                comp = build_snapshot_comparison(row, entry, self._actual(actual_code))
+                self.assertIsNone(comp["命中"]["半全场"]["修正前"])
+                self.assertIsNone(comp["命中"]["半全场"]["修正后"])
+
+    def test_unknown_actual_excluded_from_denominator(self):
+        for unknown in ("?", "??", "H?", ""):
+            with self.subTest(actual=unknown):
+                comp = build_match_comparison(self._row(), self._actual(unknown))
+                self.assertIsNone(comp["命中"]["半全场"]["修正前"])
+                self.assertIsNone(comp["命中"]["半全场"]["修正后"])
+                stats = summarize([comp])
+                self.assertEqual(stats["半全场修正前样本"], 0)
+                self.assertEqual(stats["半全场修正后样本"], 0)
+
+    def test_summary_excludes_invalid_predictions(self):
+        cases = [
+            ("周日001", "HH / HP", "HH"),   # 无效（命中合法项）
+            ("周日002", "HH / HP", "AA"),   # 无效（未命中合法项）
+            ("周日003", "HH / DH", "HH"),   # 合法命中
+            ("周日004", "HH / DH", "AA"),   # 合法未中
+        ]
+        comps = []
+        for mid, hafu, actual_code in cases:
+            row = self._row(mid=mid, hafu=hafu)
+            entry = make_snapshot_entry(
+                mid=mid,
+                original={"胜平负推荐": "主胜", "净胜球分布": "主胜1", "让球推荐": "让-1平",
+                          "总进球推荐": ["1球", "2球"], "半全场推荐": hafu.split(" / "),
+                          "比分推荐": ["1:0", "2:1"], "核心剧本": "s"},
+                fixed={"胜平负推荐": "主胜", "让球推荐": "让-1平",
+                       "总进球推荐": ["1球", "2球"], "半全场推荐": hafu.split(" / "),
+                       "比分推荐": ["1:0", "2:1"]},
+            )
+            comps.append(build_snapshot_comparison(row, entry, self._actual(actual_code)))
+        stats = summarize(comps)
+        # 两条无效预测不得进入命中/未中统计，仅 2 条合法预测参与分母
+        self.assertEqual(stats["半全场修正前样本"], 2)
+        self.assertEqual(stats["半全场修正前命中"], 1)
+        self.assertEqual(stats["半全场修正后样本"], 2)
+        self.assertEqual(stats["半全场修正后命中"], 1)
+        text = format_summary(stats)
+        self.assertIn("半全场：修正前 1/2", text)
+        self.assertIn("修正后 1/2", text)
+
+
 class TestSummaryStats(unittest.TestCase):
     """对照报告统计准确：逐字段核对计数。"""
 

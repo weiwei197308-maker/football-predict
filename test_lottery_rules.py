@@ -11,6 +11,7 @@ from lottery_rules import (
     parse_score,
     parse_hafu_codes,
     parse_hafu_code_from_text,
+    parse_hafu_picks_strict,
     cn_to_code,
     code_to_cn,
     get_result_label,
@@ -1433,8 +1434,8 @@ class TestFailedResultRow(unittest.TestCase):
             "核心剧本校验报告内容",
         )
         self.assertEqual(set(row.keys()), set(CSV_FIELDNAMES))
-        # v2 让球推导扩展：前 22 列名称与顺序逐字不变，5 个新字段仅尾部追加
-        self.assertEqual(len(CSV_FIELDNAMES), 27)
+        # v2 让球推导 + 半全场来源扩展：前 22 列名称与顺序逐字不变，新字段仅在尾部追加
+        self.assertEqual(len(CSV_FIELDNAMES), 28)
         self.assertEqual(
             CSV_FIELDNAMES[:22],
             ["编号", "联赛", "对阵", "开赛",
@@ -1445,7 +1446,8 @@ class TestFailedResultRow(unittest.TestCase):
         )
         self.assertEqual(
             CSV_FIELDNAMES[22:],
-            ["让球次选", "净胜球概率分布", "让球结果概率", "概率来源", "让球推导版本"],
+            ["让球次选", "净胜球概率分布", "让球结果概率", "概率来源", "让球推导版本",
+             "半全场来源"],
         )
         # 五种玩法推荐字段必须为空
         for f in ("胜平负推荐", "让球推荐", "总进球推荐", "半全场推荐", "比分推荐"):
@@ -1456,6 +1458,74 @@ class TestFailedResultRow(unittest.TestCase):
         self.assertIn("核心剧本校验未通过", row["综合分析"])
         self.assertEqual(row["体彩让球数"], "-1")
         self.assertEqual(row["一致性检查"], "核心剧本校验报告内容")
+
+
+class TestHafuChineseSlashSeparator(unittest.TestCase):
+    """半全场中文 "/" 分隔符支持（半X/全Y、X/Y）与碎片合并的回归守卫。"""
+
+    def test_code_from_text_slash_short_form(self):
+        self.assertEqual(parse_hafu_code_from_text("客胜/客胜"), "AA")
+        self.assertEqual(parse_hafu_code_from_text("平/客胜"), "DA")
+        self.assertEqual(parse_hafu_code_from_text("平/平"), "DD")
+
+    def test_code_from_text_slash_full_form(self):
+        self.assertEqual(parse_hafu_code_from_text("半平/全客胜"), "DA")
+        self.assertEqual(parse_hafu_code_from_text("半主胜/全平"), "HD")
+
+    def test_code_from_text_fullwidth_and_spaces(self):
+        self.assertEqual(parse_hafu_code_from_text("平／客胜"), "DA")
+        self.assertEqual(parse_hafu_code_from_text(" 平 / 客胜 "), "DA")
+
+    def test_code_from_text_slash_does_not_accept_garbage(self):
+        self.assertIsNone(parse_hafu_code_from_text("主胜/主胜/主胜"))
+        self.assertIsNone(parse_hafu_code_from_text("X/Y"))
+        self.assertIsNone(parse_hafu_code_from_text("H/D"))
+        self.assertIsNone(parse_hafu_code_from_text("平/"))
+
+    def test_strict_list_with_slash_items(self):
+        # 10-15 周四014 快照原始输出：碎片可拼回中文对
+        codes, invalids = parse_hafu_picks_strict(["平/客胜", "平/平", "客胜/客胜"])
+        self.assertEqual(codes, ["DA", "DD", "AA"])
+        self.assertEqual(invalids, [])
+
+    def test_strict_string_with_slash_pairs(self):
+        codes, invalids = parse_hafu_picks_strict("平/客胜 / 平/平")
+        self.assertEqual(codes, ["DA", "DD"])
+        self.assertEqual(invalids, [])
+
+    def test_strict_mixed_keeps_invalid_visible(self):
+        codes, invalids = parse_hafu_picks_strict("HH / 平/客胜 / ZZ")
+        self.assertEqual(codes, ["HH", "DA"])
+        self.assertEqual(invalids, ["ZZ"])
+
+    def test_strict_hda_and_invalid_unchanged(self):
+        self.assertEqual(parse_hafu_picks_strict("HH / HP"), (["HH"], ["HP"]))
+        self.assertEqual(parse_hafu_picks_strict("hh/dh"), (["HH", "DH"], []))
+
+    def test_strict_single_label_not_merged(self):
+        # 单个中文标签不是半全场选项，不得被合并成码
+        self.assertEqual(parse_hafu_picks_strict("主胜"), ([], ["主胜"]))
+        self.assertEqual(parse_hafu_picks_strict(["客胜"]), ([], ["客胜"]))
+
+    def test_strict_dedupe_and_order_preserved(self):
+        self.assertEqual(parse_hafu_picks_strict("平/客胜 / 客胜/客胜"), (["DA", "AA"], []))
+        self.assertEqual(
+            parse_hafu_picks_strict("HH / 半主胜-全主胜 / HH"), (["HH"], [])
+        )
+
+    def test_strict_dash_form_regression(self):
+        # 既有 "-" 中文表达与代码混排的解析结果不变
+        self.assertEqual(
+            parse_hafu_picks_strict("半客胜-全客胜 / 客胜-客胜"), (["AA"], [])
+        )
+
+    def test_strict_empty_inputs(self):
+        self.assertEqual(parse_hafu_picks_strict(""), ([], []))
+        self.assertEqual(parse_hafu_picks_strict(None), ([], []))
+        self.assertEqual(parse_hafu_picks_strict([]), ([], []))
+
+    def test_parse_hafu_codes_returns_codes_only(self):
+        self.assertEqual(parse_hafu_codes(["客胜-客胜", "平-客胜", "平-平"]), ["AA", "DA", "DD"])
 
 
 if __name__ == "__main__":

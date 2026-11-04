@@ -5,6 +5,12 @@ import os
 from datetime import date
 
 from review_data_loader import load_review_data
+from lottery_rules import parse_total_goals_list
+from settle_core import (
+    STATUS_HIT, STATUS_MISS, STATUS_NO_PREDICTION, STATUS_NO_DATA,
+    STATUS_UNSETTLED,
+    settle_multi_pick,
+)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 TARGET_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "竞彩总进球模拟盘.csv")
@@ -13,6 +19,7 @@ CSV_HEADER = [
     "日期", "编号", "联赛", "对阵", "信心指数",
     "AI总进球预测", "各选项赔率",
     "实际总进球数", "是否命中", "模拟投注额", "模拟盈亏",
+    "记录状态", "备注",
 ]
 
 
@@ -37,17 +44,6 @@ def load_football(date_str):
         sys.exit(1)
     with open(path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
-
-
-def parse_goals_reco(reco_str):
-    """从 '2球 / 3球 / 4球' 解析出 [2, 3, 4]。"""
-    items = [x.strip() for x in reco_str.split("/")]
-    nums = []
-    for item in items:
-        m = re.match(r"(\d+)(?:\+|球)?", item)
-        if m:
-            nums.append(int(m.group(1)))
-    return nums
 
 
 def goal_col(goal_num):
@@ -78,13 +74,12 @@ def build_row(analysis_row, football_rows, review_data, mmdd):
     confidence = analysis_row["信心指数"].strip()
     goals_reco_raw = analysis_row["总进球推荐"].strip()
 
-    goal_nums = parse_goals_reco(goals_reco_raw)
+    goal_nums = parse_total_goals_list(goals_reco_raw)
     odds_list = find_goal_odds(num, goal_nums, football_rows)
 
     # 实际总进球数：直接读 JSON 的 "赛果.总进球" 字段，已经是 "4球" 形式
     rv = review_data.get(num, {})
     actual_goals_str = rv.get("总进球", "")
-    hit_ttg = rv.get("hit_ttg")
 
     # 提取数字用于定位赔率索引
     actual_goals_num = None
@@ -95,39 +90,43 @@ def build_row(analysis_row, football_rows, review_data, mmdd):
 
     hit = ""
     pl = ""
-    bet_amount = 100
+    status = ""
+    note = ""
 
-    if actual_goals_str:
-        # 命中判定：直接读 JSON 布尔值
-        hit = "是" if hit_ttg is True else "否"
-        per_option = bet_amount / 3.0
-        if hit == "是":
-            # 定位命中赔率
-            if actual_goals_num is not None:
-                if actual_goals_num >= 7 and 7 in goal_nums:
-                    idx = goal_nums.index(7)
-                    odds_str = odds_list[idx]
-                elif actual_goals_num in goal_nums:
-                    idx = goal_nums.index(actual_goals_num)
-                    odds_str = odds_list[idx]
-                else:
-                    odds_str = ""
-            else:
-                odds_str = ""
-            try:
-                odds_val = float(odds_str)
-                raw = odds_val * per_option - bet_amount
-                pl = f"{raw:+.2f}"
-            except (ValueError, IndexError):
-                pl = "-100"
+    if not actual_goals_str:
+        # 无赛果：有预测→未结算；无预测→数据缺失
+        if goal_nums:
+            status, bet_amount = STATUS_UNSETTLED, 100
         else:
-            pl = "-100"
+            status, bet_amount = STATUS_NO_DATA, 0
+    elif not goal_nums:
+        # 有赛果但无预测输出：不得记为未中，不计 -100
+        status, bet_amount = STATUS_NO_PREDICTION, 0
+    else:
+        bet_amount = 100
+        hit_idx = -1
+        if actual_goals_num is not None:
+            key = 7 if actual_goals_num >= 7 else actual_goals_num
+            if key in goal_nums:
+                hit_idx = goal_nums.index(key)
+        st, pl_val = settle_multi_pick(bet_amount, goal_nums, odds_list, hit_idx)
+        if st == STATUS_HIT:
+            hit, pl = "是", f"{pl_val:+.2f}"
+        elif st == STATUS_MISS:
+            hit, pl = "否", f"{pl_val:+.2f}"
+        else:
+            # 命中选项赔率缺失等：命中事实保留，不结算
+            hit = "是" if hit_idx >= 0 else "否"
+            status = st
+        if not status:
+            status = st
 
     return [
         mmdd, num, league, matchup, confidence,
         goals_reco_raw, "|".join(odds_list),
         actual_goals_str, hit,
         bet_amount, pl,
+        status, note,
     ]
 
 

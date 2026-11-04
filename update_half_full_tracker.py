@@ -1,10 +1,21 @@
 import csv
+import json
 import re
 import sys
 import os
 from datetime import date
 
 from review_data_loader import load_review_data
+from lottery_rules import (
+    HAFU_SOURCE_CLEARED,
+    finalize_hafu_picks,
+    parse_hafu_picks_strict,
+)
+from settle_core import (
+    STATUS_HIT, STATUS_MISS, STATUS_NO_PREDICTION, STATUS_NO_DATA,
+    STATUS_UNSETTLED, STATUS_INVALID_CODE,
+    settle_multi_pick,
+)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 TARGET_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "竞彩半全场模拟盘.csv")
@@ -13,6 +24,7 @@ CSV_HEADER = [
     "日期", "编号", "联赛", "对阵", "信心指数",
     "AI半全场预测", "各选项赔率",
     "实际半全场", "是否命中", "模拟投注额", "模拟盈亏",
+    "记录状态", "备注",
 ]
 
 HF_COL_MAP = {
@@ -51,52 +63,6 @@ def load_football(date_str):
         return list(csv.DictReader(f))
 
 
-def to_hf_code(half_str, full_str):
-    def cn_to_letter(s):
-        s = s.strip()
-        if "主胜" in s or "主" == s:
-            return "H"
-        if "客胜" in s or "客" == s:
-            return "A"
-        if "平" in s:
-            return "D"
-        if s.upper() in ("H", "D", "A"):
-            return s.upper()
-        return None
-
-    half_l = cn_to_letter(half_str)
-    full_l = cn_to_letter(full_str)
-    if half_l and full_l:
-        return half_l + full_l
-    return None
-
-
-def parse_hf_reco(reco_str):
-    """从 'HH / DH / DD' 或 '半主胜-全主胜 / ...' 解析出代码列表。"""
-    items = [x.strip() for x in reco_str.split("/")]
-    codes = []
-    for item in items:
-        item = item.strip()
-        m = re.match(r"^([HDA]{2})$", item.upper())
-        if m:
-            codes.append(m.group(1))
-            continue
-
-        m = re.match(r"(?:半)?([^\-]+?)-(?:全)?([^\-]+)$", item)
-        if m:
-            code = to_hf_code(m.group(1), m.group(2))
-            if code:
-                codes.append(code)
-                continue
-
-        h, f = item.split("-", 1) if "-" in item else (item, "")
-        code = to_hf_code(h, f) if f else None
-        if code:
-            codes.append(code)
-
-    return codes
-
-
 def find_hf_odds(match_num, hf_codes, football_rows):
     for row in football_rows:
         if row["编号"].strip() == match_num.strip():
@@ -112,48 +78,148 @@ def clean_matchup(s):
     return re.sub(r"\[.*?\]", "", s).strip()
 
 
-def build_row(analysis_row, football_rows, review_data, mmdd):
+def load_snapshot(date_str):
+    """读取当日原始预测快照，返回 {编号: 快照条目}；文件缺失/损坏返回空 dict。"""
+    path = os.path.join(OUTPUT_DIR, f"原始预测快照_{date_str}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        print(f"[警告] 原始预测快照无法解析，按历史口径回溯: {path}")
+        return {}
+    entries = data.get("场次") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        print(f"[警告] 原始预测快照结构异常，按历史口径回溯: {path}")
+        return {}
+    index = {}
+    for entry in entries:
+        if isinstance(entry, dict):
+            key = str(entry.get("编号", "")).strip()
+            if key:
+                index[key] = entry
+    return index
+
+
+def recompute_hafu_from_snapshot(analysis_row, snapshot):
+    """用原始预测快照的模型原始半全场输出重新规范化。
+
+    仅供「分析 CSV 缺来源列且推荐为空」的历史行走快照优先口径；
+    快照缺少原始玩法输出时返回 None，由调用方退回理由回溯。
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    raw_play = snapshot.get("原始玩法输出")
+    if not isinstance(raw_play, dict) or "半全场推荐" not in raw_play:
+        return None
+    return finalize_hafu_picks(
+        raw_play.get("半全场推荐", ""),
+        analysis_row.get("胜平负推荐", ""),
+    )
+
+
+def build_row(analysis_row, football_rows, review_data, mmdd, snapshot=None):
     num = analysis_row["编号"].strip()
     league = analysis_row["联赛"].strip()
     matchup = clean_matchup(analysis_row["对阵"])
     confidence = analysis_row["信心指数"].strip()
     hf_reco_raw = analysis_row["半全场推荐"].strip()
+    # 半全场来源由 analyze.py 写入；旧 CSV 无该列时 .get 回退空串
+    hf_source = str(analysis_row.get("半全场来源", "") or "").strip()
+    # 历史 CSV 不回填来源列：仅当来源缺失时，用 analyze.py 写入的清空理由回溯分类。
+    # 理由为程序生成文本，只能证明曾被程序清空，原始 token 未在推荐字段留存。
+    hf_reason = str(analysis_row.get("半全场理由", "") or "").strip()
+    legacy_cleared = (not hf_source
+                      and "[程序校验修正]" in hf_reason
+                      and "已清空" in hf_reason)
 
-    hf_codes = parse_hf_reco(hf_reco_raw)
+    # 快照优先：来源缺失且推荐为空时按原始预测快照重算，避免把有效输出误判为清空/无预测；
+    # 快照缺失或结构不符才退回上面的理由回溯口径。
+    snapshot_used = False
+    if not hf_source and not hf_reco_raw and snapshot:
+        outcome = recompute_hafu_from_snapshot(analysis_row, snapshot)
+        if outcome is not None:
+            hf_reco_raw = " / ".join(outcome["推荐"])
+            hf_source = outcome["来源"]
+            snapshot_used = True
+
+    # 统一由 lottery_rules 严格解析；非法 token（如 HP）不静默丢弃，记入备注
+    hf_codes, invalids = parse_hafu_picks_strict(hf_reco_raw)
     odds_list = find_hf_odds(num, hf_codes, football_rows)
 
     # 实际半全场：直接读 JSON 的 "赛果.半全场"
-    # 修复旧 bug：不再用正则解析 txt，半场数据缺失场景下 JSON 里会是 "?H" 这种，
-    # hit_hafu 必为 False，所以会正确标记为"否"，不再空白
     rv = review_data.get(num, {})
     actual = rv.get("半全场", "")
-    hit_hafu = rv.get("hit_hafu")
 
     hit = ""
     pl = ""
-    bet_amount = 100
+    status = ""
+    note = f"含非法编码:{'|'.join(invalids)}" if invalids else ""
 
-    if actual:
-        # 命中判定：直接读 JSON 布尔值
-        hit = "是" if hit_hafu is True else "否"
-        per_option = bet_amount / 3.0
-        if hit == "是":
-            # 命中时定位赔率
-            idx = hf_codes.index(actual) if actual in hf_codes else -1
-            odds_str = odds_list[idx] if idx >= 0 else ""
-            try:
-                odds_val = float(odds_str)
-                raw = odds_val * per_option - bet_amount
-                pl = f"{raw:+.2f}"
-            except (ValueError, IndexError):
-                pl = "-100"
+    if not actual:
+        # 无赛果：有合法预测→未结算；已清空→含非法编码；其余无预测→数据缺失
+        if hf_codes:
+            status, bet_amount = STATUS_UNSETTLED, 100
+        elif not hf_reco_raw and hf_source == "非法输出已清空":
+            # 来源字段只能证明 analyze.py 曾清空输出，原始 token 未在推荐字段留存
+            status, bet_amount = STATUS_INVALID_CODE, 0
+            note = "非法输出已清空:程序已按校验规则清空，原始内容未在推荐字段保留"
         else:
-            pl = "-100"
+            status, bet_amount = STATUS_NO_DATA, 0
+            # 无赛果且无合法预测：备注不得残留入口处的非法编码标记
+            note = ""
+    elif not hf_codes:
+        # 有赛果但无合法预测：无预测输出、全部非法、或已被程序清空
+        if not hf_reco_raw and hf_source == "非法输出已清空":
+            # 来源字段只能证明 analyze.py 曾清空输出，原始 token 未在推荐字段留存
+            status, bet_amount = STATUS_INVALID_CODE, 0
+            note = "非法输出已清空:程序已按校验规则清空，原始内容未在推荐字段保留"
+        elif not hf_reco_raw and legacy_cleared:
+            # 旧 CSV 缺来源列：按程序写入的清空理由回溯，不改动历史数据
+            status, bet_amount = STATUS_INVALID_CODE, 0
+            note = ("非法输出已清空(来源列缺失，按历史理由回溯):"
+                    "程序已按校验规则清空，原始内容未在推荐字段保留")
+        else:
+            status = STATUS_NO_PREDICTION if not hf_reco_raw else STATUS_INVALID_CODE
+            bet_amount = 0
+            if invalids:
+                note = f"全部选项非法:{'|'.join(invalids)}"
+    elif invalids:
+        # 只要含任何非法编码，整条预测即无效：即使实际命中合法项也不结算
+        status, bet_amount = STATUS_INVALID_CODE, 0
+    else:
+        bet_amount = 100
+        hit_idx = hf_codes.index(actual) if actual in hf_codes else -1
+        st, pl_val = settle_multi_pick(bet_amount, hf_codes, odds_list, hit_idx)
+        if st == STATUS_HIT:
+            hit, pl = "是", f"{pl_val:+.2f}"
+        elif st == STATUS_MISS:
+            hit, pl = "否", f"{pl_val:+.2f}"
+        else:
+            # 命中选项赔率缺失等：命中事实保留，不结算
+            hit = "是" if hit_idx >= 0 else "否"
+            status = st
+        if not status:
+            status = st
+
+    if snapshot_used:
+        # 备注必须如实反映数据来源：原始快照内容已恢复，不能再声称"未保留"
+        if not hf_codes and hf_source == HAFU_SOURCE_CLEARED:
+            note = ("非法输出已清空(依据快照重算):"
+                    "原始快照半全场输出不含任何合法编码，程序按校验规则清空")
+        elif not hf_codes:
+            note = ""
+        elif note:
+            note = f"依据快照重算:{note}"
+        else:
+            note = "依据快照重算:原始快照半全场输出经程序规则重算"
 
     return [
         mmdd, num, league, matchup, confidence,
         hf_reco_raw, "|".join(odds_list),
         actual, hit, bet_amount, pl,
+        status, note,
     ]
 
 
@@ -184,7 +250,9 @@ def main():
     analysis_rows = load_analysis(date_str)
     football_rows = load_football(date_str)
     review_data = load_review_data(date_str, OUTPUT_DIR)
-    print(f"读取: 分析 {len(analysis_rows)} 场, 足球赔率 {len(football_rows)} 场, 复盘 {len(review_data)} 场")
+    snapshots = load_snapshot(date_str)
+    print(f"读取: 分析 {len(analysis_rows)} 场, 足球赔率 {len(football_rows)} 场, "
+          f"复盘 {len(review_data)} 场, 原始预测快照 {len(snapshots)} 场")
     print()
 
     existing = load_existing_rows()
@@ -195,7 +263,8 @@ def main():
 
     for arow in analysis_rows:
         num = arow["编号"].strip()
-        new_row = build_row(arow, football_rows, review_data, mmdd)
+        new_row = build_row(arow, football_rows, review_data, mmdd,
+                            snapshots.get(num))
         record = dict(zip(CSV_HEADER, new_row))
         key = (mmdd, num)
         actual_display = record["实际半全场"] if record["实际半全场"] else "待定"

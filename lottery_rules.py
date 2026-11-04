@@ -55,11 +55,20 @@ HAFU_CN_MAP = {
 }
 
 
+# 半全场短式中文（无 半/全 前缀）：前段=半场，后段=全场，如 "客胜-客胜"→AA。
+# 与胜平负单标签（"客胜"）不混淆：短式必须含 "-" 连接两段。
+HAFU_CN_SHORT_MAP = {
+    f"{a}-{b}": HAFU_CN_MAP[f"半{a}-全{b}"]
+    for a in ("主胜", "平", "客胜") for b in ("主胜", "平", "客胜")
+}
+
+
 def parse_hafu_code_from_text(value) -> Optional[str]:
     """把单个半全场描述安全转换为 HDA 代码。
 
-    支持 "HH"/"dh"/" AA " 等代码（大小写不敏感），
-    以及 9 种中文描述（如 "半平-全客胜" → "DA"，允许内部空格）。
+    支持 "HH"/"dh"/" AA " 等代码（大小写不敏感）、
+    9 种全式中文（如 "半平-全客胜" → "DA"）与 9 种短式中文（如 "平-客胜" → "DA"），
+    均允许内部空格，半/全分隔符也可写作 "/"（如 "平/客胜" → "DA"）。
     非法、不完整或非字符串输入一律返回 None。
     """
     if not isinstance(value, str):
@@ -69,7 +78,10 @@ def parse_hafu_code_from_text(value) -> Optional[str]:
         return None
     if len(text) == 2 and all(c in "HDA" for c in text.upper()):
         return text.upper()
-    return HAFU_CN_MAP.get(text)
+    # "半平/全客胜"、"平/客胜" 中的 "/" 是半/全分隔符，与 "X-Y" 等价；
+    # 列表分隔符的歧义由 parse_hafu_picks_strict 的合并逻辑处理。
+    text = re.sub(r"[/／]", "-", text)
+    return HAFU_CN_MAP.get(text) or HAFU_CN_SHORT_MAP.get(text)
 
 
 def parse_hafu_codes(hafu_str) -> List[str]:
@@ -78,18 +90,42 @@ def parse_hafu_codes(hafu_str) -> List[str]:
     兼容 list 输入、"/"或逗号分隔字符串、HDA 代码与中文描述混排；
     非法项跳过，结果保序去重。
     """
-    if not hafu_str:
-        return []
-    if isinstance(hafu_str, (list, tuple)):
-        raw_parts = [str(x) for x in hafu_str]
-    else:
-        raw_parts = re.split(r"[/,，、\s]+", str(hafu_str))
-    codes = []
-    for part in raw_parts:
-        code = parse_hafu_code_from_text(part)
-        if code and code not in codes:
-            codes.append(code)
+    codes, _ = parse_hafu_picks_strict(hafu_str)
     return codes
+
+
+def parse_hafu_picks_strict(hafu_str):
+    """解析半全场推荐，返回 (合法 HDA 代码列表, 非法 token 列表)。
+
+    与 parse_hafu_codes 的区别：非法项不静默丢弃，原样保留在第二个返回值中，
+    供调用方进入"非法编码"可审计状态。合法项保序去重。
+    """
+    if not hafu_str:
+        return [], []
+    if isinstance(hafu_str, (list, tuple)):
+        raw_parts = [str(x).strip() for x in hafu_str if str(x).strip()]
+    else:
+        raw_parts = [p.strip() for p in re.split(r"[/,，、]+", str(hafu_str)) if p.strip()]
+    codes, invalids = [], []
+    i = 0
+    while i < len(raw_parts):
+        part = raw_parts[i]
+        code = parse_hafu_code_from_text(part)
+        # 拆分后碎片可拼回中文对（"平" + "客胜" → "平-客胜" → DA）。
+        # 仅在单段转码失败且拼接后可转码时合并，不改变原本可解析的输入。
+        if code is None and i + 1 < len(raw_parts):
+            merged = f"{part}-{raw_parts[i + 1]}"
+            merged_code = parse_hafu_code_from_text(merged)
+            if merged_code:
+                code, part = merged_code, merged
+                i += 1
+        if code:
+            if code not in codes:
+                codes.append(code)
+        else:
+            invalids.append(part)
+        i += 1
+    return codes, invalids
 
 
 # 全场结果对应的全部合法半全场候选（用于程序兜底生成）
@@ -103,6 +139,157 @@ HAFU_CANDIDATES = {
 def hafu_candidates_for_full(spf_cn) -> List[str]:
     """按全场胜平负返回全部合法半全场候选；无法识别返回空列表。"""
     return list(HAFU_CANDIDATES.get(str(spf_cn or "").strip(), []))
+
+
+# 半全场来源标记：结构化说明「最终候选由谁产生」，不得改写模型原始输出本身
+HAFU_SOURCE_MODEL = "模型原始"
+HAFU_SOURCE_CORRECTED = "程序修正"
+HAFU_SOURCE_FALLBACK = "程序兜底"
+HAFU_SOURCE_CLEARED = "非法输出已清空"
+HAFU_SOURCE_NOT_OUTPUT = "模型未输出"
+
+
+def _hafu_outcome(codes, source, reason, fixes, unjudgeable):
+    """统一半全场规范化结果结构。
+
+    codes 为 None 表示未发生候选改写（原字段必须原样保留）；
+    reason 为 None 表示沿用调用方原理由。
+    """
+    return {
+        "推荐": None if codes is None else list(codes),
+        "来源": source,
+        "理由": reason,
+        "fixes": list(fixes),
+        "unjudgeable": list(unjudgeable),
+    }
+
+
+def finalize_hafu_picks(raw_value, spf_raw, old_reason=""):
+    """把模型原始半全场输出规范为最终候选、来源标记与理由（纯函数）。
+
+    供 analyze.post_process_prediction 与 update_half_full_tracker 共用，保证
+    同一份原始输出在两处得到逐字相同的推荐/理由/来源，避免口径漂移。
+
+    规则：
+    - 中文描述转 HDA 代码；非法 token 过滤但不静默丢弃，记入 fixes；
+    - 全场胜平负可识别时，保留与其兼容的候选；全部不兼容则按规则兜底；
+    - 全场胜平负缺失时保留可解析候选，但明确标注兼容性无法核对；
+    - 无任何合法编码时清空，来源标记为「非法输出已清空」；
+    - 原始输出为空且全场可识别时程序兜底，否则「模型未输出」。
+
+    Args:
+        raw_value: 模型原始半全场推荐（list 或 "/"分隔字符串）
+        spf_raw: 模型原始胜平负推荐（未规范化）
+        old_reason: 模型原始半全场理由；仅在程序改写候选时作为「原理由」附后
+
+    Returns:
+        dict: 推荐 / 来源 / 理由 / fixes / unjudgeable；
+        「理由」为 None 表示未发生改写，调用方应保留原有理由字段不变。
+    """
+    spf_text = str(spf_raw or "").strip()
+    spf = normalize_core_result(spf_text) or spf_text
+    old_reason = str(old_reason or "").strip()
+
+    if isinstance(raw_value, list):
+        raw_tokens = [str(t).strip() for t in raw_value if str(t).strip()]
+    else:
+        raw_tokens = [t.strip() for t in re.split(r"[/,，、\s]+", str(raw_value or ""))
+                      if t.strip()]
+    codes, invalid_tokens = parse_hafu_picks_strict(raw_tokens)
+    hda_tokens = [t for t in raw_tokens
+                  if len(t) == 2 and all(c in "HDA" for c in t.upper())]
+    hda_only_codes, _ = parse_hafu_picks_strict(hda_tokens)
+    # 非 HDA 输入（含碎片合并）贡献了候选，才视为发生过中文转码
+    had_chinese = codes != hda_only_codes
+
+    valid_spf = spf in ("主胜", "平", "客胜")
+    if codes and valid_spf:
+        compatible = [c for c in codes if is_hafu_compatible(c, spf)]
+        removed = [c for c in codes if c not in compatible]
+        if not compatible:
+            fallback = hafu_candidates_for_full(spf)
+            invalid_note = (f"已过滤非法半全场编码 {invalid_tokens}；"
+                            if invalid_tokens else "")
+            reason = (
+                f"[程序校验修正] {invalid_note}原半全场推荐与全场 {spf} 全部不兼容，"
+                f"已按规则兜底生成 {' / '.join(fallback)}（程序兜底生成，待模型确认）。"
+            )
+            fixes = [f"半全场全部不兼容，程序兜底生成 {fallback}（待模型确认）"]
+            if had_chinese:
+                fixes.append("半全场推荐含中文描述，已中文转码为 HDA 代码")
+            if invalid_tokens:
+                fixes.append(f"半全场过滤非法编码 {invalid_tokens}")
+            return _hafu_outcome(fallback, HAFU_SOURCE_FALLBACK, reason, fixes, [])
+        if removed or invalid_tokens or had_chinese:
+            cause_parts = []
+            if removed:
+                cause_parts.append(f"移除与全场 {spf} 不兼容的半全场 {removed}")
+            if invalid_tokens:
+                cause_parts.append(f"过滤非法半全场编码 {invalid_tokens}")
+            if had_chinese:
+                cause_parts.append("中文半全场描述已规范化转码为 HDA 代码")
+            reason = (
+                "[程序校验修正] " + "；".join(cause_parts) + "。"
+                + (f"原理由：{old_reason}" if old_reason else "")
+            )
+            fixes = []
+            if removed:
+                fixes.append(f"半全场移除不兼容项 {removed}")
+            if invalid_tokens:
+                fixes.append(f"半全场过滤非法编码 {invalid_tokens}")
+            if had_chinese:
+                fixes.append("半全场推荐含中文描述，已中文转码为 HDA 代码")
+            return _hafu_outcome(compatible, HAFU_SOURCE_CORRECTED, reason, fixes, [])
+        # 合法、全部兼容、无非法 token、无中文描述：模型原始输出即最终候选
+        return _hafu_outcome(codes, HAFU_SOURCE_MODEL, None, [], [])
+
+    if codes:
+        # 半全场可解析但胜平负缺失/不可识别：保留转码结果，兼容性无法核对
+        spf_desc = (f"缺失（{spf_text!r}）" if not spf_text
+                    else f"无法识别（{spf_text!r}）")
+        unjudgeable = [f"胜平负推荐{spf_desc}，半全场兼容性无法判定"]
+        if invalid_tokens or had_chinese:
+            cause_parts = []
+            if had_chinese:
+                cause_parts.append("中文半全场描述已规范化转码为 HDA 代码")
+            if invalid_tokens:
+                cause_parts.append(f"过滤非法半全场编码 {invalid_tokens}")
+            reason = (
+                "[程序校验修正] " + "；".join(cause_parts)
+                + f"。胜平负推荐{spf_desc}，无法核对兼容性。"
+                + (f"原理由：{old_reason}" if old_reason else "")
+            )
+            fixes = []
+            if had_chinese:
+                fixes.append("半全场推荐含中文描述，已中文转码为 HDA 代码")
+            if invalid_tokens:
+                fixes.append(f"半全场过滤非法编码 {invalid_tokens}")
+            return _hafu_outcome(codes, HAFU_SOURCE_CORRECTED, reason, fixes, unjudgeable)
+        return _hafu_outcome(codes, HAFU_SOURCE_MODEL, None, [], unjudgeable)
+
+    if raw_tokens:
+        reason = (
+            "[程序校验修正] 半全场推荐不含任何合法编码"
+            + (f"且胜平负缺失（{spf_text!r}）" if not valid_spf else "")
+            + "，无法判定，已清空；需模型重新生成。"
+        )
+        return _hafu_outcome(
+            [], HAFU_SOURCE_CLEARED, reason, [],
+            ["半全场推荐不含任何合法编码，无法判定"],
+        )
+
+    if valid_spf:
+        fallback = hafu_candidates_for_full(spf)
+        if fallback:
+            reason = (
+                f"[程序校验修正] 半全场推荐缺失，按全场 {spf} 规则兜底生成 "
+                f"{' / '.join(fallback)}（程序兜底生成，待模型确认）。"
+            )
+            return _hafu_outcome(
+                fallback, HAFU_SOURCE_FALLBACK, reason,
+                [f"半全场缺失，程序兜底生成 {fallback}"], [],
+            )
+    return _hafu_outcome(None, HAFU_SOURCE_NOT_OUTPUT, None, [], [])
 
 
 def cn_to_code(label: str) -> Optional[str]:
@@ -421,11 +608,15 @@ def run_consistency_checks(prediction: Dict, handicap) -> Tuple[List[str], List[
         if not ok:
             hard_errors.append(msg)
 
-    # 检查 4：半全场 vs 全场胜平负（硬性）
-    if spf and hafu_rec:
+    # 检查 4：半全场 vs 全场胜平负（硬性；胜平负不可识别时降级为无法判定）
+    if spf and hafu_rec and cn_to_code(spf) is not None:
         ok, msg = check_hafu_vs_full(hafu_rec, spf)
         if not ok:
             hard_errors.append(msg)
+    elif spf and hafu_rec:
+        msg = f"胜平负推荐无法识别（{spf!r}），半全场兼容性无法判定"
+        if msg not in unjudgeable:
+            unjudgeable.append(msg)
 
     # 检查 6：备选比分逐个检查（格式硬性；方向/净胜球区间为软性提示）
     for s in scores[1:]:

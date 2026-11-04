@@ -14,7 +14,7 @@ from lottery_rules import (
     cn_to_code,
     parse_handicap,
     compute_handicap_result,
-    parse_hafu_codes,
+    parse_hafu_picks_strict,
     parse_score as rules_parse_score,
     parse_total_goals_list,
     extract_handicap_direction,
@@ -99,24 +99,24 @@ def get_result_after_handicap(home_goals, away_goals, goal_line):
 
 def check_spf(pred, actual_label):
     if not pred:
-        return False, "无预测"
+        return None, "无预测"
     return pred.strip() == actual_label, actual_label
 
 
 def check_rq(pred, actual_label_rq):
     """让球命中：方向由 lottery_rules.extract_handicap_direction 统一提取。"""
     if not pred:
-        return False, "无预测"
+        return None, "无预测"
     pred_label = extract_handicap_direction(pred.strip())
     if pred_label is None:
-        return False, actual_label_rq
+        return None, actual_label_rq
     return pred_label == actual_label_rq, actual_label_rq
 
 
 def check_ttg(pred_str, actual_total):
     recs = parse_total_goals_list(pred_str)
     if not recs:
-        return False, actual_total
+        return None, actual_total
     return actual_total in recs, actual_total
 
 
@@ -127,17 +127,43 @@ def check_crs(pred_str, actual_home, actual_away):
         if pair:
             recs.append(pair)
     if not recs:
-        return False, f"{actual_home}:{actual_away}"
+        return None, f"{actual_home}:{actual_away}"
     return (actual_home, actual_away) in recs, f"{actual_home}:{actual_away}"
 
 
 def check_hafu(pred_str, half_code, full_code):
-    """半全场命中：中文描述/代码统一由 lottery_rules.parse_hafu_codes 解析。"""
-    recs = parse_hafu_codes(pred_str)
-    if not recs:
-        return False, f"{half_code}{full_code}"
+    """半全场命中：严格解析，含任何非法编码的整条预测视为无效（返回 None）。
+
+    统一口径：非法 token（如 HP）不得被静默丢弃；只要出现一个，就不判中、不判错，
+    因此该场不进命中率分母、不进错误清单、不触发归因。
+    """
+    recs, invalids = parse_hafu_picks_strict(pred_str)
     actual_combo = f"{half_code}{full_code}"
+    # 半场/全场赛果无法解析（编码含 "?"）时不可判定，不得当作普通未命中
+    if "?" in actual_combo or not recs or invalids:
+        return None, actual_combo
     return actual_combo in recs, actual_combo
+
+
+# 半全场来源/状态标记（CSV「半全场来源」列与每日记录共用）
+HAFU_SOURCE_INVALID_CLEARED = "非法输出已清空"
+HAFU_STATUS_VALID = "有效预测"
+HAFU_STATUS_INVALID = "非法输出已清空"
+HAFU_STATUS_NO_PREDICTION = "模型未输出"
+
+
+def resolve_hafu_status(source, hafu_hit):
+    """区分半全场三类状态：有效预测 / 非法输出已清空 / 模型未输出。
+
+    后两类都不进命中率分母，但必须保留可追溯的状态差异：
+    非法清空是"模型给过输出但被程序清空"，无预测是"模型本来没给"。
+    旧 CSV 没有「半全场来源」列时按命中结果回退，行为与修复前一致。
+    """
+    if str(source or "").strip() == HAFU_SOURCE_INVALID_CLEARED:
+        return HAFU_STATUS_INVALID
+    if hafu_hit is None:
+        return HAFU_STATUS_NO_PREDICTION
+    return HAFU_STATUS_VALID
 
 
 def call_deepseek_for_attribution(match_info, errors):
@@ -202,6 +228,18 @@ def run_review(date_str=None):
         print(f"\n❌ 找不到 {date_str} 的体彩数据，请先运行 get_matches.py")
         return
 
+    # 输入有效性保护：分析 CSV 缺失或没有任何数据行时禁止进入写入流程。
+    # 否则空场次列表会静默覆盖既有 每日记录/竞彩复盘（output/ 未纳入 Git，无法恢复）。
+    analysis_path = f"output/竞彩分析_{date_str}.csv"
+    if not os.path.exists(analysis_path):
+        print(f"\n❌ 找不到 {date_str} 的竞彩分析文件：{analysis_path}")
+        print("   请先运行 analyze.py 生成预测；本次复盘已停止，未覆盖任何已有记录")
+        return
+    if not analysis_rows:
+        print(f"\n❌ {analysis_path} 没有任何预测数据行（空文件或仅有表头）")
+        print("   本次复盘已停止，未覆盖任何已有记录")
+        return
+
     # 编号白名单：本销售日竞彩分析 CSV 中出现过的全部场次编号。
     # 体彩编号按销售日编排，但深夜场次跨零点开球，官方 API 的 matchDate 会记成次日，
     # 必须用编号白名单圈定场次，不能只靠 matchDate 过滤（否则跨零点场次全部漏抓）。
@@ -229,7 +267,10 @@ def run_review(date_str=None):
     print(f"  � 本地体彩数据 {len(tecai_matches)} 场 | AI 分析 {len(analysis_rows)} 场\n")
 
     results = []
-    stats = {"total": 0, "spf_hit": 0, "rq_hit": 0, "ttg_hit": 0, "hafu_hit": 0, "crs_hit": 0}
+    stats = {"total": 0,
+             "spf_hit": 0, "rq_hit": 0, "ttg_hit": 0, "hafu_hit": 0, "crs_hit": 0,
+             "spf_valid": 0, "rq_valid": 0, "ttg_valid": 0, "hafu_valid": 0, "crs_valid": 0,
+             "hafu_invalid": 0, "hafu_no_prediction": 0}
 
     for ana in analysis_rows:
         num = ana.get("编号", "")
@@ -281,20 +322,31 @@ def run_review(date_str=None):
         ttg_hit, ttg_actual = check_ttg(pred_ttg, actual_total)
         crs_hit, crs_actual = check_crs(pred_crs, h_full, a_full)
         hafu_hit, hafu_actual = check_hafu(pred_hafu, half_code, full_code)
+        # 新增 CSV 列缺失（旧文件）时为空串，走旧逻辑，不因缺列崩溃
+        hafu_source = str(ana.get("半全场来源", "") or "").strip()
+        if hafu_source == HAFU_SOURCE_INVALID_CLEARED:
+            hafu_hit = None
+        hafu_status = resolve_hafu_status(hafu_source, hafu_hit)
 
         stats["total"] += 1
-        if spf_hit: stats["spf_hit"] += 1
-        if rq_hit: stats["rq_hit"] += 1
-        if ttg_hit: stats["ttg_hit"] += 1
-        if crs_hit: stats["crs_hit"] += 1
-        if hafu_hit: stats["hafu_hit"] += 1
+        # 三态命中：True 命中 / False 有效预测未中 / None 无预测（不进分母、不进归因）
+        for key, val in (("spf", spf_hit), ("rq", rq_hit), ("ttg", ttg_hit),
+                         ("crs", crs_hit), ("hafu", hafu_hit)):
+            if val is not None:
+                stats[f"{key}_valid"] += 1
+                if val:
+                    stats[f"{key}_hit"] += 1
+        if hafu_status == HAFU_STATUS_INVALID:
+            stats["hafu_invalid"] += 1
+        elif hafu_status == HAFU_STATUS_NO_PREDICTION:
+            stats["hafu_no_prediction"] += 1
 
         errors = []
-        if not spf_hit: errors.append(("spf", pred_spf, spf_actual))
-        if not rq_hit: errors.append(("rq", pred_rq, rq_actual))
-        if not ttg_hit: errors.append(("ttg", pred_ttg, f"{ttg_actual}球"))
-        if not hafu_hit: errors.append(("hafu", pred_hafu, hafu_actual))
-        if not crs_hit: errors.append(("crs", pred_crs, crs_actual))
+        if spf_hit is False: errors.append(("spf", pred_spf, spf_actual))
+        if rq_hit is False: errors.append(("rq", pred_rq, rq_actual))
+        if ttg_hit is False: errors.append(("ttg", pred_ttg, f"{ttg_actual}球"))
+        if hafu_hit is False: errors.append(("hafu", pred_hafu, hafu_actual))
+        if crs_hit is False: errors.append(("crs", pred_crs, crs_actual))
 
         match_info = {
             "num": num,
@@ -329,10 +381,18 @@ def run_review(date_str=None):
             "pred_rq": pred_rq, "actual_rq": rq_actual, "rq_hit": rq_hit,
             "pred_ttg": pred_ttg, "actual_ttg": f"{actual_total}球", "ttg_hit": ttg_hit,
             "pred_hafu": pred_hafu, "actual_hafu": hafu_actual, "hafu_hit": hafu_hit,
+            "hafu_source": hafu_source, "hafu_status": hafu_status,
             "pred_crs": pred_crs, "actual_crs": f"{h_full}:{a_full}", "crs_hit": crs_hit,
             "attribution": attribution,
         }
         results.append(result)
+
+    if not results:
+        # 兜底保护：CSV 有行但全部无有效预测、或窗口内无匹配赛果时，
+        # 同样不得用空场次覆盖既有每日记录与复盘报告。
+        print(f"\n⚠️ {date_str} 没有可复盘场次（无有效预测或无匹配赛果），"
+              f"已停止写入，保留已有记录")
+        return
 
     report_lines = generate_report(date_str, results, stats)
     report_text = "\n".join(report_lines)
@@ -365,6 +425,9 @@ def run_review(date_str=None):
                 "总进球": r["ttg_hit"], "半全场": r["hafu_hit"], "比分": r["crs_hit"],
             },
             "错误归因": r.get("attribution"),
+            # 新增字段：半全场来源与三态状态（非法清空不得降级为普通空预测）
+            "半全场来源": r["hafu_source"],
+            "半全场状态": r["hafu_status"],
         }
         daily_record.append(rec)
 
@@ -398,14 +461,31 @@ def generate_report(date_str, results, stats):
     total = stats["total"]
     if total > 0:
         lines.append(f"  总分析场次：{total}")
-        lines.append(f"  胜平负命中：{stats['spf_hit']}/{total}  ({stats['spf_hit']*100//total}%)")
-        lines.append(f"  让球胜平负：{stats['rq_hit']}/{total}  ({stats['rq_hit']*100//total}%)")
-        lines.append(f"  总进球命中：{stats['ttg_hit']}/{total}  ({stats['ttg_hit']*100//total}%)")
-        lines.append(f"  半全场命中：{stats['hafu_hit']}/{total}  ({stats['hafu_hit']*100//total}%)")
-        lines.append(f"  比分命中：{stats['crs_hit']}/{total}  ({stats['crs_hit']*100//total}%)")
-        total_hits = stats["spf_hit"] + stats["rq_hit"] + stats["ttg_hit"] + stats["hafu_hit"] + stats["crs_hit"]
-        total_possible = total * 5
-        lines.append(f"  🏆 综合命中率：{total_hits}/{total_possible}  ({total_hits*100//total_possible}%)")
+        for label, key in (("胜平负", "spf"), ("让球胜平负", "rq"), ("总进球", "ttg"),
+                           ("半全场", "hafu"), ("比分", "crs")):
+            # 有效场次必须由统计方显式提供；缺失时不可用总场次冒充分母
+            if f"{key}_valid" not in stats:
+                lines.append(f"  {label}命中：不可计算（缺少有效场次统计）")
+                continue
+            valid = stats[f"{key}_valid"]
+            hits = stats[f"{key}_hit"]
+            if valid:
+                lines.append(f"  {label}命中：{hits}/{valid}  ({hits*100//valid}%)")
+            else:
+                lines.append(f"  {label}命中：0/0（无有效预测）")
+        # 半全场样本分布：非法清空与无预测都不进分母，但必须分开呈现
+        if stats.get("hafu_invalid") or stats.get("hafu_no_prediction"):
+            lines.append(
+                f"  半全场样本：有效 {stats.get('hafu_valid', 0)} / "
+                f"非法输出已清空 {stats.get('hafu_invalid', 0)} / "
+                f"无预测 {stats.get('hafu_no_prediction', 0)}（后两类不计入分母）"
+            )
+        valid_keys = [f"{k}_valid" for k in ("spf", "rq", "ttg", "hafu", "crs")]
+        if all(k in stats for k in valid_keys):
+            total_hits = stats["spf_hit"] + stats["rq_hit"] + stats["ttg_hit"] + stats["hafu_hit"] + stats["crs_hit"]
+            total_possible = sum(stats[k] for k in valid_keys)
+            if total_possible:
+                lines.append(f"  🏆 综合命中率：{total_hits}/{total_possible}  ({total_hits*100//total_possible}%)")
     lines.append("")
 
     lines.append("📋 逐场复盘详情")
@@ -427,7 +507,14 @@ def generate_report(date_str, results, stats):
             ("比分", r['pred_crs'], r['actual_crs'], r['crs_hit']),
         ]
         for dim_name, pred, actual, hit in dims:
-            mark = "✅" if hit else "❌"
+            if hit is None and dim_name == "半全场" and r.get("hafu_status") == HAFU_STATUS_INVALID:
+                # 非法清空：既非命中、也非未中，更不能显示成普通无预测
+                lines.append(f"      ⛔ {dim_name}：非法输出已清空（不计命中）  实际「{actual}」")
+                continue
+            if hit is None:
+                mark = "➖"  # 无预测输出：既非命中也非预测错误
+            else:
+                mark = "✅" if hit else "❌"
             lines.append(f"      {mark} {dim_name}：预测「{pred}」  实际「{actual}」")
 
         if r.get("attribution"):

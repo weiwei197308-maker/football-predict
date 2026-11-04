@@ -5,6 +5,12 @@ import os
 from datetime import date
 
 from review_data_loader import load_review_data
+from lottery_rules import parse_score as rules_parse_score
+from settle_core import (
+    STATUS_HIT, STATUS_MISS, STATUS_NO_PREDICTION, STATUS_NO_DATA,
+    STATUS_UNSETTLED,
+    settle_multi_pick,
+)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 TARGET_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "竞彩比分模拟盘.csv")
@@ -13,6 +19,7 @@ CSV_HEADER = [
     "日期", "编号", "联赛", "对阵", "信心指数",
     "AI比分预测", "各选项赔率",
     "实际比分", "是否命中", "模拟投注额", "模拟盈亏",
+    "记录状态", "备注",
 ]
 
 
@@ -40,7 +47,22 @@ def load_football(date_str):
 
 
 def parse_score_reco(reco_str):
-    return [x.strip() for x in reco_str.split("/")]
+    """解析比分推荐，返回 (合法比分 token 列表, 非法 token 列表)。
+
+    合法 = 能被 lottery_rules.parse_score 解析为 (主, 客) 整数对；
+    非法 token 不静默丢弃，供"含非法编码"审计状态使用。
+    """
+    valid, invalids = [], []
+    for x in reco_str.split("/"):
+        x = x.strip()
+        if not x:
+            continue
+        if rules_parse_score(x):
+            if x not in valid:
+                valid.append(x)
+        else:
+            invalids.append(x)
+    return valid, invalids
 
 
 def score_col(score_str):
@@ -69,38 +91,47 @@ def build_row(analysis_row, football_rows, review_data, mmdd):
     confidence = analysis_row["信心指数"].strip()
     score_reco_raw = analysis_row["比分推荐"].strip()
 
-    scores = parse_score_reco(score_reco_raw)
+    scores, invalids = parse_score_reco(score_reco_raw)
     odds_list = find_score_odds(num, scores, football_rows)
 
     # 实际比分：直接读 JSON 的 "赛果.比分"，已经是 "2:2" 形式（用冒号）
     rv = review_data.get(num, {})
     actual = rv.get("比分", "")
-    hit_crs = rv.get("hit_crs")
 
     hit = ""
     pl = ""
-    bet_amount = 100
+    status = ""
+    note = f"含非法编码:{'|'.join(invalids)}" if invalids else ""
 
-    if actual:
-        # 命中判定：直接读 JSON 布尔值
-        hit = "是" if hit_crs is True else "否"
-        per_option = bet_amount / 3.0
-        if hit == "是":
-            idx = scores.index(actual) if actual in scores else -1
-            odds_str = odds_list[idx] if idx >= 0 else ""
-            try:
-                odds_val = float(odds_str)
-                raw = odds_val * per_option - bet_amount
-                pl = f"{raw:+.2f}"
-            except (ValueError, IndexError):
-                pl = "-100"
+    if not actual:
+        # 无赛果：有预测→未结算；无预测→数据缺失
+        if scores:
+            status, bet_amount = STATUS_UNSETTLED, 100
         else:
-            pl = "-100"
+            status, bet_amount = STATUS_NO_DATA, 0
+    elif not scores:
+        # 有赛果但无合法预测输出：不记未中，不计 -100
+        status, bet_amount = STATUS_NO_PREDICTION, 0
+    else:
+        bet_amount = 100
+        hit_idx = scores.index(actual) if actual in scores else -1
+        st, pl_val = settle_multi_pick(bet_amount, scores, odds_list, hit_idx)
+        if st == STATUS_HIT:
+            hit, pl = "是", f"{pl_val:+.2f}"
+        elif st == STATUS_MISS:
+            hit, pl = "否", f"{pl_val:+.2f}"
+        else:
+            # 命中选项赔率缺失等：命中事实保留，不结算
+            hit = "是" if hit_idx >= 0 else "否"
+            status = st
+        if not status:
+            status = st
 
     return [
         mmdd, num, league, matchup, confidence,
         score_reco_raw, "|".join(odds_list),
         actual, hit, bet_amount, pl,
+        status, note,
     ]
 
 

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """错题归因总表生成器（独立脚本，项目第 5 张表）。
 
-遍历 output/每日记录_*.json 的所有场次 × 5 玩法，命中严格为 False（v is False）
-才产一行；命中 key 缺失或为 None 不产行（与 tracker 的 bool(get) 口径不同，见对账说明）。
+遍历 output/每日记录_*.json 的所有场次 × 5 玩法，**用规范判定函数重新判定**该玩法
+是否真的错，只有判定为 False（有效预测且未中）才产一行。
+
+为什么不再读 JSON 的"命中"字段：历史 JSON 由旧版 review.py 写入，半全场中文预测被
+判错、空预测被判 False，直接沿用会把已命中的比赛继续当错题（审计问题 A/C）。
+统一改为从 预判/赛果 现场重算，命中判定与 review.py/tracker 同源（lottery_rules 解析）：
+  - None（空预测/非法编码/无法判定/赛果缺失）不产行；
+  - 非法编码（如 HP）不静默映射，也不算模型预测错误。
 
 归因来源：
   - 该场存在有效深度归因 → "深度"：摘要与根因分类**仅**取【失败根因】段
@@ -18,6 +24,10 @@ import glob
 import json
 import os
 import re
+
+from lottery_rules import parse_score as rules_parse_score
+from review import check_spf, check_rq, check_ttg, check_crs
+from settle_core import parse_hafu_for_settle
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 TARGET_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "错题归因总表.csv")
@@ -117,8 +127,66 @@ def classify(text):
     return "|".join(cats) if cats else UNCLASSIFIED
 
 
+_UNDECIDABLE_ACTUAL = ("", "无法判定", "无预测", "?")
+
+
+def judge_playbook(playbook, pred, actual):
+    """用规范判定函数重算某玩法命中结果。返回 True / False / None（无法判定）。
+
+    None 的情形一律不产出错题行：空预测（无预测输出）、非法编码（如 HP）、
+    赛果缺失/不可解析（未结算）。判定口径与 review.py / tracker 同源。
+    """
+    pred_text = str((pred or {}).get(playbook, "") or "").strip()
+    if not pred_text:
+        return None
+    act = actual or {}
+
+    if playbook == "胜平负":
+        label = str(act.get("胜平负", "") or "").strip()
+        if label in _UNDECIDABLE_ACTUAL:
+            return None
+        return check_spf(pred_text, label)[0]
+
+    if playbook == "让球":
+        label = str(act.get("让球", "") or "").strip()
+        if label in _UNDECIDABLE_ACTUAL:
+            return None
+        return check_rq(pred_text, label)[0]
+
+    if playbook == "总进球":
+        m = re.match(r"(\d+)", str(act.get("总进球", "") or ""))
+        if not m:
+            return None
+        total = int(m.group(1))
+        return check_ttg(pred_text, 7 if total >= 7 else total)[0]
+
+    if playbook == "半全场":
+        code = str(act.get("半全场", "") or "").strip().upper()
+        if len(code) != 2 or "?" in code:
+            return None
+        codes, invalids, _ = parse_hafu_for_settle(pred_text)
+        if not codes:
+            return None
+        # 含任何非法 token 的整条预测视为无效：不判命中、不判未中、不产归因
+        if invalids:
+            return None
+        return code in codes
+
+    if playbook == "比分":
+        pair = rules_parse_score(str(act.get("比分", "") or "").strip())
+        if not pair:
+            return None
+        return check_crs(pred_text, pair[0], pair[1])[0]
+
+    return None
+
+
 def build_rows(output_dir=OUTPUT_DIR):
-    """遍历所有每日记录，产出错题行列表（一场一玩法一行）。"""
+    """遍历所有每日记录，产出错题行列表（一场一玩法一行）。
+
+    每个玩法都用规范判定函数从 预判/赛果 重算，只有结论为 False 才算错题：
+    True（已命中）、None（空预测/非法编码/无法判定/赛果缺失）均不产行。
+    """
     deep_by_date = load_deep_attributions(output_dir)
     rows = []
     for path in sorted(glob.glob(os.path.join(output_dir, "每日记录_*.json"))):
@@ -135,12 +203,10 @@ def build_rows(output_dir=OUTPUT_DIR):
             num = str(item.get("编号") or "").strip()
             if not num:
                 continue
-            hits = item.get("命中") or {}
             pred = item.get("预判") or {}
             actual = item.get("赛果") or {}
 
-            # 严格 v is False 才算错题；key 缺失 / None 不产行
-            wrong_playbooks = [p for p in PLAYBOOKS if hits.get(p) is False]
+            wrong_playbooks = [p for p in PLAYBOOKS if judge_playbook(p, pred, actual) is False]
             if not wrong_playbooks:
                 continue
 

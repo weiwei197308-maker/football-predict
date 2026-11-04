@@ -72,7 +72,8 @@ class TestCheckSpf(unittest.TestCase):
         self.assertTrue(check_spf(" 主胜 ", "主胜")[0])
 
     def test_empty(self):
-        self.assertEqual(check_spf("", "平"), (False, "无预测"))
+        # 审计修复后口径：空预测 → None（三态），不再按未中(False)计入分母
+        self.assertEqual(check_spf("", "平"), (None, "无预测"))
 
 
 class TestCheckRq(unittest.TestCase):
@@ -91,11 +92,11 @@ class TestCheckRq(unittest.TestCase):
         self.assertEqual(check_rq("让-1主胜", "客胜"), (False, "客胜"))
 
     def test_empty_pred(self):
-        self.assertEqual(check_rq("", "主胜"), (False, "无预测"))
+        self.assertEqual(check_rq("", "主胜"), (None, "无预测"))
 
     def test_unrecognizable_pred(self):
-        """无方向关键词时判未命中，实际值原样返回。"""
-        self.assertEqual(check_rq("xyz", "主胜"), (False, "主胜"))
+        """无法解析出方向的预测文本视为"无有效预测"（None），不计入命中率分母。"""
+        self.assertEqual(check_rq("xyz", "主胜"), (None, "主胜"))
 
 
 class TestCheckTtg(unittest.TestCase):
@@ -113,8 +114,8 @@ class TestCheckTtg(unittest.TestCase):
         self.assertTrue(check_ttg(["2球", "3球"], 3)[0])
 
     def test_empty(self):
-        self.assertEqual(check_ttg("", 2), (False, 2))
-        self.assertEqual(check_ttg(None, 2), (False, 2))
+        self.assertEqual(check_ttg("", 2), (None, 2))
+        self.assertEqual(check_ttg(None, 2), (None, 2))
 
 
 class TestCheckCrs(unittest.TestCase):
@@ -129,8 +130,9 @@ class TestCheckCrs(unittest.TestCase):
         self.assertTrue(check_crs("2-1", 2, 1)[0])
 
     def test_empty_or_garbage(self):
-        self.assertEqual(check_crs("", 1, 0), (False, "1:0"))
-        self.assertEqual(check_crs("garbage", 2, 1), (False, "2:1"))
+        # 空预测与无法解析的预测均为 None（无有效预测），不记未中
+        self.assertEqual(check_crs("", 1, 0), (None, "1:0"))
+        self.assertEqual(check_crs("garbage", 2, 1), (None, "2:1"))
 
 
 class TestCheckHafu(unittest.TestCase):
@@ -158,11 +160,12 @@ class TestCheckHafu(unittest.TestCase):
     def test_mixed_codes_and_chinese(self):
         self.assertTrue(check_hafu("HH / 半平-全主胜", "D", "H")[0])
 
-    def test_invalid_items_skipped(self):
-        self.assertTrue(check_hafu("XH / HH / XX", "H", "H")[0])
+    def test_invalid_items_make_prediction_undecidable(self):
+        """含任何非法编码的整条预测无效：返回 None，不当作命中或未中。"""
+        self.assertIsNone(check_hafu("XH / HH / XX", "H", "H")[0])
 
     def test_empty(self):
-        self.assertEqual(check_hafu("", "H", "H"), (False, "HH"))
+        self.assertEqual(check_hafu("", "H", "H"), (None, "HH"))
 
 
 if __name__ == "__main__":
