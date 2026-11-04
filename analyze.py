@@ -8,14 +8,27 @@ import copy
 from datetime import date
 
 from football_history import build_history_for_match
+
+# 总进球影子实验（A/B/C/D 组）：默认关闭；导入失败绝不阻断正式预测。
+try:
+    import ttg_shadow
+except Exception:
+    ttg_shadow = None
+
+# 让球影子实验（A/B/C/D + 市场组）：默认开启；导入失败绝不阻断正式预测。
+try:
+    import rq_shadow
+except Exception:
+    rq_shadow = None
+
+# 半全场影子实验（A/B/C/D + 市场组）：默认开启；导入失败绝不阻断正式预测。
+try:
+    import hafu_shadow
+except Exception:
+    hafu_shadow = None
 from lottery_rules import (
     parse_handicap,
     parse_score,
-    parse_hafu_codes,
-    parse_hafu_code_from_text,
-    hafu_candidates_for_full,
-    is_hafu_compatible,
-    normalize_result_label,
     run_consistency_checks,
     derive_handicap_recommendation,
     validate_core_script,
@@ -28,6 +41,7 @@ from lottery_rules import (
     format_net_goal_probabilities,
     format_handicap_probabilities,
     validate_net_goal_probabilities,
+    finalize_hafu_picks,
     MARKET_STATE_INDETERMINATE,
     HANDICAP_VERSION_V1,
     HANDICAP_VERSION_V2,
@@ -261,8 +275,10 @@ SYSTEM_PROMPT = """你是一位专业的竞彩足球分析师，遵循「中国�
 5. 比分 (CRS)：全场具体比分，推荐 3 个
 
 分析顺序（严格按此顺序思考）：
-步骤1【基本面与赔率】：结合赔率识别市场倾向、净胜球临界线与风险，但赔率只作辅助证据，
-  不得替代独立判断，也不得机械地把低赔等同于稳胆、或仅因赔率高就排除某结果。
+步骤1【基本面与赔率】：先识别本场胜平负主胜赔率所在区间，再采用对应策略：
+  • 赔率 < 1.4（超级热门）：市场定价极准，你的判断应以验证市场为起点。需主动排查市场可能未充分定价的反向信号：主队轮换幅度、客队近期客场表现、双方休息天数差、联赛杯赛战意等。若找不到反向信号，信心应维持"高"；若找到但力度有限，可适当降信心，但不得为了"独立"而强行推翻市场。
+  • 赔率 1.4–1.5（临界热门）：⚠️ 本区间是你的历史薄弱区，命中率显著低于市场隐含概率。市场在此赔率已包含让球数、主客场抵消、战意平衡等多重调节因素，你易误判为"市场有盲点"。此区间应以"市场为准、仅查市场遗漏"为原则，若认为市场有误，必须列出具体遗漏点（如：X队轮换7人、Y队客场三连败），并据此降低信心，不得空泛地"独立推翻"。
+  • 赔率 ≥ 1.5（中冷至冷门）：市场定价已含平衡噪声（为了平衡投注量而偏离真实概率），你可在此区间独立推演攻防、排名、状态等因素，赔率仅作参考。若你的独立判断与市场方向一致，可提信心；若显著不同，也应有勇气维持独立判断。
 步骤2【比赛剧本】：判断比赛整体倾向（主胜/平/客胜）、可能的比赛剧本、净胜球分布
   （主胜2+ / 主胜1 / 平 / 客胜1 / 客胜2+）、最可能净胜球区间、不确定性因素、支持证据。
 步骤3【推导胜平负】：由剧本得出胜平负首选。
@@ -270,8 +286,11 @@ SYSTEM_PROMPT = """你是一位专业的竞彩足球分析师，遵循「中国�
   判断净胜球区间是否横跨临界线；再据首选比分推导让球胜/平/负。
   不允许仅根据主胜/客胜直接生成让球结论；胜平负方向与让球方向不一致（如主胜剧本让球为平/负）属合理情况，
   必须在让球理由中说明其临界条件。
+  让球赔率区间行为（⚠️ 历史数据关键观察，442场统计）：
+  • 让球赔率 < 2.0（负 ROI 区）：你的让球命中率在此区间显著低于市场隐含概率，ROI 为负。这是让球临界效应最严重的区域——市场认为让球稳胆（如让-1主胜），但主队赢 1 球就是让平，你易误判为"市场有盲点"而独立推翻，导致额外亏损。此区间应以"验证市场让球方向、重点排查让平可能性"为原则，降低信心，不得空泛地独立推出与市场相反的让球结论。
+  • 让球赔率 ≥ 2.0（正 ROI 区）：你的独立判断在此区间能有效还原真实概率——让-1平方向命中率比市场隐含高 10pp，ROI +29%。此区间可发挥独立判断优势，大胆给出让球方向，同时明确说明让球临界条件。
 步骤5【推导半全场】：先判断上半场走势，再结合全场剧本。半全场的全场部分必须与胜平负一致。
-步骤6【推导总进球】：根据比赛节奏和候选比分，总进球必须与首选比分相容。
+步骤6【推导总进球】：根据比赛节奏和候选比分，总进球必须与首选比分相容。推荐 3 个，首选必须等于首选比分的进球总数。
 步骤7【推导比分】：候选比分必须支持胜平负方向、符合净胜球分布、与总进球和让球相容；
   不同净胜球区间的备选比分必须标注为替代剧本。
 
@@ -833,60 +852,20 @@ def post_process_prediction(parsed, handicap_line, match_data=None):
             result["总进球推荐"] = canonical
 
     # 3. 半全场：中文转码 → 过滤不兼容 → 全不兼容/缺失时规则兜底
-    spf_raw = str(result.get("胜平负推荐", "") or "").strip()
-    spf = normalize_result_label(spf_raw) or spf_raw
-    hafu_val = result.get("半全场推荐", [])
-    if isinstance(hafu_val, list):
-        raw_tokens = [str(t).strip() for t in hafu_val if str(t).strip()]
-    else:
-        raw_tokens = [t.strip() for t in re.split(r"[/,，、\s]+", str(hafu_val or "")) if t.strip()]
-    codes = parse_hafu_codes(raw_tokens)
-    had_chinese = any(
-        not (len(t) == 2 and all(c in "HDA" for c in t.upper())) and parse_hafu_code_from_text(t)
-        for t in raw_tokens
+    # 规则集中在 lottery_rules.finalize_hafu_picks，与半全场模拟盘重算共用同一口径。
+    hafu_outcome = finalize_hafu_picks(
+        result.get("半全场推荐", []),
+        result.get("胜平负推荐", ""),
+        old_reason=str(result.get("半全场理由", "") or "").strip(),
     )
-    if had_chinese:
-        notes.append("半全场推荐含中文描述，已中文转码为 HDA 代码")
-    if codes and spf in ("主胜", "平", "客胜"):
-        compatible = [c for c in codes if is_hafu_compatible(c, spf)]
-        removed = [c for c in codes if c not in compatible]
-        if not compatible:
-            fallback = hafu_candidates_for_full(spf)
-            result["半全场推荐"] = fallback
-            result["半全场理由"] = (
-                f"[程序校验修正] 原半全场推荐与全场 {spf} 全部不兼容，"
-                f"已按规则兜底生成 {' / '.join(fallback)}（程序兜底生成，待模型确认）。"
-            )
-            fixes.append(f"半全场全部不兼容，程序兜底生成 {fallback}（待模型确认）")
-        elif removed:
-            result["半全场推荐"] = compatible
-            old_reason = str(result.get("半全场理由", "") or "").strip()
-            result["半全场理由"] = (
-                f"[程序校验修正] 移除与全场 {spf} 不兼容的半全场 {removed}。"
-                + (f"原理由：{old_reason}" if old_reason else "")
-            )
-            fixes.append(f"半全场移除不兼容项 {removed}")
-        else:
-            result["半全场推荐"] = codes
-    elif codes:
-        # 半全场可解析但胜平负缺失：保留转码结果，兼容性无法核对
-        result["半全场推荐"] = codes
-        extra_unjudgeable.append(f"胜平负推荐缺失（{spf_raw!r}），半全场兼容性无法判定")
-    elif raw_tokens:
-        result["半全场推荐"] = []
-        result["半全场理由"] = (
-            "[程序校验修正] 半全场推荐无法解析且胜平负缺失，无法判定，已清空；需模型重新生成。"
-        )
-        extra_unjudgeable.append("半全场推荐无法解析且胜平负缺失，无法判定")
-    elif spf in ("主胜", "平", "客胜"):
-        fallback = hafu_candidates_for_full(spf)
-        if fallback:
-            result["半全场推荐"] = fallback
-            result["半全场理由"] = (
-                f"[程序校验修正] 半全场推荐缺失，按全场 {spf} 规则兜底生成 "
-                f"{' / '.join(fallback)}（程序兜底生成，待模型确认）。"
-            )
-            fixes.append(f"半全场缺失，程序兜底生成 {fallback}")
+    # 推荐/理由为 None 表示该字段无需改写（模型原始输出直接可用）
+    if hafu_outcome["推荐"] is not None:
+        result["半全场推荐"] = hafu_outcome["推荐"]
+    if hafu_outcome["理由"] is not None:
+        result["半全场理由"] = hafu_outcome["理由"]
+    fixes.extend(hafu_outcome["fixes"])
+    extra_unjudgeable.extend(hafu_outcome["unjudgeable"])
+    result["半全场来源"] = hafu_outcome["来源"]
 
     # A 思路：并入让球临界线分析说明与无法判定项（不改变已由程序推导的让球结论）
     handicap_notes = list(handicap_analysis.get("notes", []))
@@ -1001,6 +980,8 @@ CSV_FIELDNAMES = [
     "数据缺失说明", "一致性检查",
     # v2 让球推导新增字段（尾部追加，前 22 列含义与顺序保持不变）
     "让球次选", "净胜球概率分布", "让球结果概率", "概率来源", "让球推导版本",
+    # 半全场来源标记（尾部追加，用于区分模型原始/程序修正/程序兜底/非法清空/未输出）
+    "半全场来源",
 ]
 
 
@@ -1036,6 +1017,74 @@ def _validate_result_row_fields(row, fieldnames, row_index=0):
     if extra:
         problems.append(f"多余字段 {extra}")
     return "; ".join(problems) if problems else None
+
+
+def build_snapshot_entry(parsed, match_data, match_num, handicap_line, check_report):
+    """构造单场比赛的原始预测快照条目（从 main() 平移，行为不变）。"""
+    snap = parsed.get("_原始快照") or {}
+    return {
+        "编号": match_num,
+        "对阵": match_data["对阵"],
+        "体彩让球数": handicap_line,
+        "原始玩法输出": snap.get("原始玩法输出", {}),
+        "锁定核心剧本": snap.get("锁定核心剧本", {}),
+        "修正后预测": {k: v for k, v in parsed.items() if not k.startswith("_")},
+        "一致性检查": check_report,
+    }
+
+
+def build_result_row(parsed, match_data, match_num, league, handicap_line, check_report, history):
+    """构造单场正式 CSV 结果行（从 main() 平移，行为不变）。"""
+    history_text = ""
+    if history and history.get("available"):
+        parts = []
+        if history.get("home_recent_text"):
+            parts.append(history["home_recent_text"])
+        if history.get("away_recent_text"):
+            parts.append(history["away_recent_text"])
+        if history.get("h2h_text"):
+            parts.append(history["h2h_text"])
+        history_text = "\n".join(parts)
+
+    # 推荐类字段统一转成 " / " 分隔字符串，兼容下游 CSV 读取
+    def _join(val):
+        if isinstance(val, list):
+            return " / ".join(str(v) for v in val)
+        return str(val or "")
+
+    return {
+        "编号": match_num,
+        "联赛": league,
+        "对阵": match_data["对阵"],
+        "开赛": match_data["开赛"],
+        "胜平负推荐": parsed.get("胜平负推荐", ""),
+        "胜平负理由": parsed.get("胜平负理由", ""),
+        "让球推荐": parsed.get("让球推荐", ""),
+        "让球理由": parsed.get("让球理由", ""),
+        "总进球推荐": _join(parsed.get("总进球推荐", [])),
+        "总进球理由": parsed.get("总进球理由", ""),
+        "半全场推荐": _join(parsed.get("半全场推荐", [])),
+        "半全场理由": parsed.get("半全场理由", ""),
+        "比分推荐": _join(parsed.get("比分推荐", [])),
+        "比分理由": parsed.get("比分理由", ""),
+        "信心指数": parsed.get("信心指数", ""),
+        "综合分析": parsed.get("综合分析", ""),
+        "历史数据": history_text,
+        # 新增字段
+        "核心剧本": parsed.get("核心剧本", ""),
+        "净胜球分布": parsed.get("净胜球分布", ""),
+        "体彩让球数": handicap_line,
+        "数据缺失说明": parsed.get("数据缺失说明", ""),
+        "一致性检查": check_report,
+        # v2 让球推导：结构化概率转文本落 CSV（v1 降级时为标注文本/空，不伪造）
+        "让球次选": parsed.get("让球次选", ""),
+        "净胜球概率分布": format_net_goal_probabilities(parsed.get("净胜球概率分布")),
+        "让球结果概率": format_handicap_probabilities(parsed.get("让球结果概率")),
+        "概率来源": parsed.get("概率来源", ""),
+        "让球推导版本": parsed.get("让球推导版本", ""),
+        # 半全场来源：结构化标记，不改写原始快照中的模型原始输出
+        "半全场来源": parsed.get("半全场来源", ""),
+    }
 
 
 def save_analysis_csv(all_results, target_date, output_dir="output"):
@@ -1094,13 +1143,26 @@ def main():
         print(f"错误：{key_err}")
         sys.exit(1)
 
+    # 销售日保护：只分析「今天」自己的赛程文件，绝不回退使用其它日期的数据。
+    # 背景：2026-10-27 赛程抓取失败（体彩接口 SSL 中断）时，旧逻辑取到 10-26 的 CSV，
+    # 并以其文件名作为 target_date，把 10-26 的分析 CSV 与原始预测快照整体覆写
+    # （output/ 未纳入 Git，历史版本不可恢复）。日期不一致时直接终止，不写任何文件。
+    today_str = date.today().strftime("%Y-%m-%d")
     csv_path = find_latest_csv()
     if not csv_path:
         sys.exit(1)
 
     target_date_match = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(csv_path))
-    target_date = target_date_match.group(1) if target_date_match else date.today().strftime("%Y-%m-%d")
+    csv_date = target_date_match.group(1) if target_date_match else None
+    if csv_date != today_str:
+        print(f"错误：最新赛程文件不是今天（{today_str}）：{csv_path}")
+        if csv_date:
+            print(f"   该文件属于销售日 {csv_date}，继续分析会覆写 {csv_date} 的分析 CSV 与原始预测快照。")
+        print("   已终止，未写入任何文件。请先运行 get_matches.py 获取今日赛程；")
+        print("   若今天不是竞彩销售日，本步骤应跳过，不要用历史数据代替。")
+        sys.exit(1)
 
+    target_date = today_str
     rows = load_matches_from_csv(csv_path)
 
     print()
@@ -1109,6 +1171,17 @@ def main():
 
     all_results = []
     snapshots = []
+    # 总进球影子实验：默认关闭；开启时仅在内存收集，正式产物写完后统一落盘
+    shadow_on = ttg_shadow is not None and ttg_shadow.shadow_enabled()
+    shadow_records = []
+    shadow_collected = 0
+    # 让球/半全场影子实验：默认开启；同样仅在内存收集，正式产物写完后统一落盘
+    shadow_on_rq = rq_shadow is not None and rq_shadow.shadow_enabled()
+    shadow_records_rq = []
+    shadow_collected_rq = 0
+    shadow_on_hafu = hafu_shadow is not None and hafu_shadow.shadow_enabled()
+    shadow_records_hafu = []
+    shadow_collected_hafu = 0
 
     for i, row in enumerate(rows, 1):
         home = row.get("主队", "")
@@ -1145,66 +1218,35 @@ def main():
         print("完成")
         parsed["一致性检查"] = check_report
         print_analysis(match_data, parsed)
-        snap = parsed.get("_原始快照") or {}
-        snapshots.append({
-            "编号": match_num,
-            "对阵": match_data["对阵"],
-            "体彩让球数": handicap_line,
-            "原始玩法输出": snap.get("原始玩法输出", {}),
-            "锁定核心剧本": snap.get("锁定核心剧本", {}),
-            "修正后预测": {k: v for k, v in parsed.items() if not k.startswith("_")},
-            "一致性检查": check_report,
-        })
+        snapshots.append(build_snapshot_entry(
+            parsed, match_data, match_num, handicap_line, check_report))
+        all_results.append(build_result_row(
+            parsed, match_data, match_num, league, handicap_line, check_report, history))
 
-        history_text = ""
-        if history and history.get("available"):
-            parts = []
-            if history.get("home_recent_text"):
-                parts.append(history["home_recent_text"])
-            if history.get("away_recent_text"):
-                parts.append(history["away_recent_text"])
-            if history.get("h2h_text"):
-                parts.append(history["h2h_text"])
-            history_text = "\n".join(parts)
-
-        # 推荐类字段统一转成 " / " 分隔字符串，兼容下游 CSV 读取
-        def _join(val):
-            if isinstance(val, list):
-                return " / ".join(str(v) for v in val)
-            return str(val or "")
-
-        result_row = {
-            "编号": match_num,
-            "联赛": league,
-            "对阵": match_data["对阵"],
-            "开赛": match_data["开赛"],
-            "胜平负推荐": parsed.get("胜平负推荐", ""),
-            "胜平负理由": parsed.get("胜平负理由", ""),
-            "让球推荐": parsed.get("让球推荐", ""),
-            "让球理由": parsed.get("让球理由", ""),
-            "总进球推荐": _join(parsed.get("总进球推荐", [])),
-            "总进球理由": parsed.get("总进球理由", ""),
-            "半全场推荐": _join(parsed.get("半全场推荐", [])),
-            "半全场理由": parsed.get("半全场理由", ""),
-            "比分推荐": _join(parsed.get("比分推荐", [])),
-            "比分理由": parsed.get("比分理由", ""),
-            "信心指数": parsed.get("信心指数", ""),
-            "综合分析": parsed.get("综合分析", ""),
-            "历史数据": history_text,
-            # 新增字段
-            "核心剧本": parsed.get("核心剧本", ""),
-            "净胜球分布": parsed.get("净胜球分布", ""),
-            "体彩让球数": handicap_line,
-            "数据缺失说明": parsed.get("数据缺失说明", ""),
-            "一致性检查": check_report,
-            # v2 让球推导：结构化概率转文本落 CSV（v1 降级时为标注文本/空，不伪造）
-            "让球次选": parsed.get("让球次选", ""),
-            "净胜球概率分布": format_net_goal_probabilities(parsed.get("净胜球概率分布")),
-            "让球结果概率": format_handicap_probabilities(parsed.get("让球结果概率")),
-            "概率来源": parsed.get("概率来源", ""),
-            "让球推导版本": parsed.get("让球推导版本", ""),
-        }
-        all_results.append(result_row)
+        # 影子实验采集：只读 match_data/parsed，任何失败仅打印，不影响正式产物
+        if shadow_on:
+            try:
+                shadow_records.append(ttg_shadow.collect_shadow_record(
+                    row, history, match_data, parsed, api_key, target_date))
+                shadow_collected += 1
+            except Exception as e:
+                print(f"  [影子实验] 记录失败（不影响正式预测）：{e}")
+        # 让球影子实验采集：只读 match_data/parsed，任何失败仅打印
+        if shadow_on_rq:
+            try:
+                shadow_records_rq.append(rq_shadow.collect_shadow_record(
+                    row, history, match_data, parsed, api_key, target_date))
+                shadow_collected_rq += 1
+            except Exception as e:
+                print(f"  [让球影子实验] 记录失败（不影响正式预测）：{e}")
+        # 半全场影子实验采集：只读 match_data/parsed，任何失败仅打印
+        if shadow_on_hafu:
+            try:
+                shadow_records_hafu.append(hafu_shadow.collect_shadow_record(
+                    row, history, match_data, parsed, api_key, target_date))
+                shadow_collected_hafu += 1
+            except Exception as e:
+                print(f"  [半全场影子实验] 记录失败（不影响正式预测）：{e}")
 
     save_analysis_csv(all_results, target_date)
 
@@ -1219,6 +1261,37 @@ def main():
         except (OSError, ValueError, TypeError) as e:
             print(f"保存快照失败：{e}")
             print(f"原始玩法输出未丢失（{len(snapshots)} 场），可在内存检查后重试")
+
+    # 影子实验落盘：在正式 CSV 与快照全部写完后执行；任何失败不影响正式产物
+    if shadow_on:
+        try:
+            stats = ttg_shadow.write_shadow_file(
+                shadow_records, target_date, collected_count=shadow_collected)
+            print(f"[影子实验] {stats['状态']}：新增 {stats['新增数']}，"
+                  f"重复跳过 {stats['重复跳过数']}，冲突 {stats['冲突数']}，"
+                  f"合并后总记录 {stats['合并后总记录数']}（{stats['文件路径']}）")
+        except Exception as e:
+            print(f"[影子实验] 写入异常（不影响正式产物）：{e}")
+    # 让球影子实验落盘
+    if shadow_on_rq:
+        try:
+            stats = rq_shadow.write_shadow_file(
+                shadow_records_rq, target_date, collected_count=shadow_collected_rq)
+            print(f"[让球影子实验] {stats['状态']}：新增 {stats['新增数']}，"
+                  f"重复跳过 {stats['重复跳过数']}，冲突 {stats['冲突数']}，"
+                  f"合并后总记录 {stats['合并后总记录数']}（{stats['文件路径']}）")
+        except Exception as e:
+            print(f"[让球影子实验] 写入异常（不影响正式产物）：{e}")
+    # 半全场影子实验落盘
+    if shadow_on_hafu:
+        try:
+            stats = hafu_shadow.write_shadow_file(
+                shadow_records_hafu, target_date, collected_count=shadow_collected_hafu)
+            print(f"[半全场影子实验] {stats['状态']}：新增 {stats['新增数']}，"
+                  f"重复跳过 {stats['重复跳过数']}，冲突 {stats['冲突数']}，"
+                  f"合并后总记录 {stats['合并后总记录数']}（{stats['文件路径']}）")
+        except Exception as e:
+            print(f"[半全场影子实验] 写入异常（不影响正式产物）：{e}")
 
 
 if __name__ == "__main__":
