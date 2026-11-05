@@ -821,6 +821,77 @@ def run_evaluate_play(play, output_dir="output"):
     }
 
 
+# ========== C2 独立判断对照 ==========
+
+def compute_c2_comparison(records):
+    """C2独立 vs C正式：仅统计 C2 已启用且双方均有效的已结算场次。
+
+    C2 与 C 共用同一场次、同一赔率快照，差异只来自提示词，
+    因此这组配对是判断“独立判断版提示词是否改变选球行为”的唯一干净证据。
+    """
+    enabled = 0
+    pairs = []
+    for rec in records:
+        actual = (rec.get("实际赛果") or {})
+        actual_label = actual.get("总进球")
+        if not actual_label:
+            continue
+        c2 = rec.get(config.TTG_C2_GROUP)
+        if not isinstance(c2, dict) or c2.get("状态") in (None, "", "disabled"):
+            continue
+        enabled += 1
+        if c2.get("状态") != "ok":
+            continue
+        c = rec.get("C正式") or {}
+        if c.get("状态") != "ok":
+            continue
+        c_picks = [p for p in (c.get("候选") or []) if _canon(p) is not None]
+        c2_picks = [p for p in (c2.get("候选") or []) if _canon(p) is not None]
+        if not c_picks or not c2_picks:
+            continue
+        pairs.append({"实际": actual_label, "C": c_picks, "C2": c2_picks})
+
+    n = len(pairs)
+    if n == 0:
+        return {
+            "启用场次数": enabled,
+            "配对数": 0,
+            "说明": "暂无 C2 已启用且双方均有效的已结算场次",
+        }
+
+    def _hit(key):
+        return round(sum(1 for p in pairs if p[key][0] == p["实际"]) / n * 100, 2)
+
+    def _cover(key):
+        return round(sum(1 for p in pairs if p["实际"] in p[key]) / n * 100, 2)
+
+    def _avg_len(key):
+        return round(sum(len(p[key]) for p in pairs) / n, 2)
+
+    def _dist(key):
+        cnt = {}
+        for p in pairs:
+            top = p[key][0]
+            cnt[top] = cnt.get(top, 0) + 1
+        return {k: round(v / n * 100, 2) for k, v in sorted(cnt.items())}
+
+    return {
+        "启用场次数": enabled,
+        "配对数": n,
+        "C首选命中率": _hit("C"),
+        "C2首选命中率": _hit("C2"),
+        "C覆盖率": _cover("C"),
+        "C2覆盖率": _cover("C2"),
+        "C候选数均值": _avg_len("C"),
+        "C2候选数均值": _avg_len("C2"),
+        "C首选分布": _dist("C"),
+        "C2首选分布": _dist("C2"),
+        "C首选未进入C2候选的场次": sum(
+            1 for p in pairs if p["C"][0] not in p["C2"]
+        ),
+    }
+
+
 # ========== 入口 ==========
 
 def run_evaluate(output_dir="output"):
@@ -864,6 +935,7 @@ def run_evaluate(output_dir="output"):
         "ab_pair": ab_result,
         "extreme_buckets": extreme,
         "d_market_table": d_market,
+        "c2_comparison": compute_c2_comparison(records),
         "quality_report": loaded["quality_report"],
         "runkey_conflicts": loaded["runkey_conflicts"],
         "matchkey_conflicts": loaded["matchkey_conflicts"],

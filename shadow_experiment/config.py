@@ -30,6 +30,7 @@ PROTECTED_FILE_PATTERNS = [
 # ========== 标签 → 数值 / 区间映射 ==========
 TTG_LABELS = ["0球", "1球", "2球", "3球", "4球", "5球", "6球", "7+球"]
 FIXED_BASELINE_PICKS = ["2球", "3球", "4球"]  # D 组固定候选，硬编码但在 config 里冻结
+TTG_C2_GROUP = "C2独立"  # 总进球独立思考版对照组（仅总进球，默认启用，DISABLE_TTG_C2=1 关闭）
 
 
 def label_to_number(label):

@@ -183,8 +183,8 @@ class TestMainEndToEnd(unittest.TestCase):
         try:
             self.assertEqual(csv_text, GOLDENS["csv_text"])
             self.assertEqual(snap_text, GOLDENS["snapshot_text"])
-            # 2 场 ×（2 正式 + 2 影子）
-            self.assertEqual(post_mock.call_count, 4 * len(ROWS))
+            # 2 场 ×（2 正式 + A/B/C/C2/D 五组影子；C2 默认启用）
+            self.assertEqual(post_mock.call_count, 5 * len(ROWS))
             path = ttg_shadow.shadow_file_path(FIXED_DATE, os.path.join(tmp, "output"))
             self.assertTrue(os.path.exists(path))
             with open(path, encoding="utf-8") as f:

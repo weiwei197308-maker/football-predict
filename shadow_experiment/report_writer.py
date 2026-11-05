@@ -153,6 +153,34 @@ def write_shadow_report_md(result, date_str):
         )
     lines.append("")
 
+    # C2 独立判断对照（仅总进球，且仅双方均有效）
+    c2c = result.get("c2_comparison") or {}
+    if c2c.get("配对数"):
+        def _fmt_dist(d):
+            return "  ".join(f"{k} {v}%" for k, v in (d or {}).items())
+
+        lines.append("## C2 独立判断对照（C正式 vs C2独立）")
+        lines.append("")
+        lines.append(
+            f"仅统计 C2 已启用且双方均有效的已结算场次：**n={c2c['配对数']}**"
+            f"（C2 启用并已结算 {c2c['启用场次数']} 场）")
+        lines.append("")
+        lines.append("| 指标 | C正式 | C2独立 |")
+        lines.append("|---|---|---|")
+        lines.append(f"| 首选命中率 | {c2c['C首选命中率']}% | {c2c['C2首选命中率']}% |")
+        lines.append(f"| 候选覆盖率 | {c2c['C覆盖率']}% | {c2c['C2覆盖率']}% |")
+        lines.append(f"| 候选数均值 | {c2c['C候选数均值']} | {c2c['C2候选数均值']} |")
+        lines.append("")
+        lines.append(f"- C 首选球数分布：{_fmt_dist(c2c['C首选分布'])}")
+        lines.append(f"- C2 首选球数分布：{_fmt_dist(c2c['C2首选分布'])}")
+        lines.append(f"- C 首选未进入 C2 候选的场次：{c2c['C首选未进入C2候选的场次']}")
+        lines.append("")
+    elif c2c:
+        lines.append("## C2 独立判断对照（C正式 vs C2独立）")
+        lines.append("")
+        lines.append(f"- {c2c.get('说明', '暂无可用配对')}（已启用并结算 {c2c.get('启用场次数', 0)} 场）")
+        lines.append("")
+
     # A→B 配对
     ab = result["ab_pair"]
     lines.append("## A→B 复核价值分析")
