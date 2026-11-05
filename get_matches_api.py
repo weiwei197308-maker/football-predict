@@ -4,8 +4,15 @@
 另写 output/history_cache_{date}.json（供 M1/M2 分析时零请求读取历史数据）。
 
 请求预算（Free 100/天）：
-  fixtures 1 次 + 每场 odds 1 次 + 每场历史 3 次（两队 last=5 + h2h）；
+  fixtures 1 次 + 每场 odds 1 次 + 历史（h2h 源决定，见下）；
   先查 /status（不计额），预留 RESULTS_RESERVE 给赛果回填，超额按联赛优先级截断。
+
+h2h 源开关（环境变量 H2H_SOURCE，默认 compare）：
+  goal    = 只用 goal-api（1 次/场 API-Football 配额，仅 odds）
+  api     = 只用 API-Football h2h（2 次/场）
+  compare = 主路径用 goal，前 H2H_COMPARE_N（默认 3）场额外双源对照，
+            产物 output/shadow_h2h_compare_{date}.json；失败自动回退 API-Football。
+  goal/compare 需要 GOAL_API_KEY（仅从环境变量读取，缺失即 fail-fast）。
 
 用法：
   python get_matches_api.py [--date YYYY-MM-DD] [--dry-run] [--no-history] [--output-dir output]
@@ -22,9 +29,15 @@ from datetime import date, datetime, timedelta, timezone
 
 import requests
 
+import goal_history
 from leagues_config import BY_API_ID
 
 BASE = "https://v3.football.api-sports.io"
+H2H_SOURCE_ENV = "H2H_SOURCE"
+H2H_COMPARE_N_ENV = "H2H_COMPARE_N"
+H2H_SOURCES = ("goal", "api", "compare")
+DEFAULT_H2H_SOURCE = "compare"
+DEFAULT_H2H_COMPARE_N = 3
 BOOKMAKER_ID = 8  # bet365
 RESULTS_RESERVE = 3
 CST = timezone(timedelta(hours=8))
@@ -78,6 +91,48 @@ def get_remaining():
     if not isinstance(d, dict) or "requests" not in d:
         raise RuntimeError(f"API /status 返回异常: {payload}")
     return d["requests"]["limit_day"] - d["requests"]["current"]
+
+
+# ---------------- h2h 源开关与 API-Football 预算 ----------------
+
+def resolve_h2h_source():
+    raw = (os.environ.get(H2H_SOURCE_ENV, "") or "").strip().lower()
+    if not raw:
+        return DEFAULT_H2H_SOURCE
+    if raw not in H2H_SOURCES:
+        sys.exit(f"错误：{H2H_SOURCE_ENV}={raw} 非法，可选值：goal / api / compare")
+    return raw
+
+
+def resolve_compare_n():
+    raw = (os.environ.get(H2H_COMPARE_N_ENV, "") or "").strip()
+    if not raw:
+        return DEFAULT_H2H_COMPARE_N
+    try:
+        n = int(raw)
+    except ValueError:
+        sys.exit(f"错误：{H2H_COMPARE_N_ENV}={raw} 非法，需为非负整数")
+    if n < 0:
+        sys.exit(f"错误：{H2H_COMPARE_N_ENV}={raw} 非法，需为非负整数")
+    return n
+
+
+def max_matches_for_budget(budget, source, compare_n):
+    """API-Football 预算内最多跑多少场（odds 1 次/场；历史按源计）。"""
+    if budget <= 0:
+        return 0
+    if source == "api":
+        return budget // 2
+    if source == "compare" and compare_n > 0:
+        if budget <= 2 * compare_n:
+            return budget // 2
+        return budget - compare_n
+    return budget
+
+
+def _api_history_budget_ok(remaining):
+    """回退 API-Football 前检查：至少给赛果回填留出 RESULTS_RESERVE。"""
+    return remaining - RESULTS_RESERVE - _req_count >= 1
 
 
 # ---------------- 赔率映射 ----------------
@@ -204,6 +259,97 @@ def fetch_history(home_id, away_id, season=None):
     }
 
 
+def _empty_history():
+    return {"home_recent": [], "away_recent": [], "h2h": [],
+            "home_recent_text": "", "away_recent_text": "", "h2h_text": "",
+            "available": False}
+
+
+def resolve_history(match_id, home_id, away_id, index, source, can_spend_api):
+    """按开关取历史，返回 (entry, 来源标签, 错误类型, goal 原始结果)。
+
+    来源标签写入 _raw.json 的 history_source：
+      goal / api / none（none = 两种源都失败或预算不允许回退）。
+    goal 解析为空（available=False）也视为失败并回退 API-Football。
+    """
+    err = None
+    goal_entry = None
+    if source in ("goal", "compare"):
+        try:
+            goal_entry = goal_history.fetch_history_goal(match_id, home_id, away_id, index)
+            if goal_entry.get("available"):
+                return goal_entry, "goal", None, goal_entry
+            err = "empty"
+        except goal_history.GoalApiError as e:
+            err = e.kind
+        except Exception as e:  # 适配层意外异常也必须降级，不拖垮赛程主流程
+            err = f"unexpected:{type(e).__name__}"
+
+    if not can_spend_api:
+        return _empty_history(), "none", err or "api_budget", goal_entry
+
+    try:
+        return fetch_history(home_id, away_id), "api", err, goal_entry
+    except Exception as e:
+        return _empty_history(), "none", err or f"api_failed:{type(e).__name__}", goal_entry
+
+
+def _history_snapshot(entry):
+    return {
+        "available": bool(entry.get("available")),
+        "home_recent_text": entry.get("home_recent_text", ""),
+        "away_recent_text": entry.get("away_recent_text", ""),
+        "h2h_text": entry.get("h2h_text", ""),
+    }
+
+
+def build_compare_record(number, match_id, home_name, away_name, goal_entry,
+                         api_entry, goal_error, api_error):
+    """compare 模式单场双源快照（只写独立 shadow 文件，不进正式链路）。"""
+    g = _history_snapshot(goal_entry) if goal_entry else None
+    a = _history_snapshot(api_entry) if api_entry else None
+    diff = None
+    if g and a:
+        diff = {k: g[k] == a[k] for k in
+                ("available", "home_recent_text", "away_recent_text", "h2h_text")}
+    return {
+        "number": number,
+        "matchId": str(match_id),
+        "home": home_name,
+        "away": away_name,
+        "goal": g,
+        "api": a,
+        "goal_error": goal_error,
+        "api_error": api_error,
+        "diff": diff,
+    }
+
+
+def save_compare_report(records, target_date, output_dir):
+    """写 output/shadow_h2h_compare_{date}.json；已存在则加时间戳，绝不覆盖。"""
+    path = os.path.join(output_dir, f"shadow_h2h_compare_{target_date}.json")
+    if os.path.exists(path):
+        path = os.path.join(
+            output_dir,
+            f"shadow_h2h_compare_{target_date}_{datetime.now().strftime('%H%M%S')}.json")
+    summary = {
+        "matches": len(records),
+        "goal_available": sum(1 for r in records if (r.get("goal") or {}).get("available")),
+        "api_available": sum(1 for r in records if (r.get("api") or {}).get("available")),
+        "identical_text": sum(1 for r in records if r.get("diff") and all(r["diff"].values())),
+    }
+    payload = {
+        "date": target_date,
+        "generated_at": datetime.now(CST).isoformat(timespec="seconds"),
+        "compare_n": len(records),
+        "summary": summary,
+        "items": records,
+    }
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
+    return path
+
+
 # ---------------- 行构造与落盘 ----------------
 
 def build_row(fixture, mapped, number, league_cfg):
@@ -264,6 +410,16 @@ def main():
     ap.add_argument("--output-dir", default="output")
     args = ap.parse_args()
 
+    source = resolve_h2h_source()
+    compare_n = resolve_compare_n()
+    if not args.no_history and source in ("goal", "compare"):
+        try:
+            goal_history.get_goal_api_key()
+        except goal_history.GoalApiError as e:
+            sys.exit(f"错误：{e}")
+    print(f"h2h 源：{source}"
+          + (f"（对照前 {compare_n} 场）" if source == "compare" else ""))
+
     remaining = get_remaining()
     print(f"API 当日剩余请求：{remaining}（预算控制：预留 {RESULTS_RESERVE} 给赛果回填）")
 
@@ -307,14 +463,31 @@ def main():
         print("今天白名单内没有未开赛比赛。")
         return
 
-    per_match = 1 if args.no_history else 2
-    max_matches = max(0, (remaining - RESULTS_RESERVE - _req_count) // per_match)
+    budget = remaining - RESULTS_RESERVE - _req_count
+    budget_source = "goal" if args.no_history else source
+    budget_compare_n = compare_n if (source == "compare" and not args.no_history) else 0
+    max_matches = max_matches_for_budget(budget, budget_source, budget_compare_n)
     if len(picked) > max_matches:
-        print(f"⚠️ 预算不足：{len(picked)} 场需 {len(picked)*per_match} 请求，"
-              f"仅可跑 {max_matches} 场，按优先级截断。")
+        print(f"⚠️ 因 API-Football 预算截断：{len(picked)} 场按优先级仅可跑 "
+              f"{max_matches} 场（可用预算 {budget}，h2h 源={source}，"
+              f"预留 {RESULTS_RESERVE} 给赛果）。")
         picked = picked[:max_matches]
 
+    goal_index = {}
+    if not args.no_history and source in ("goal", "compare"):
+        try:
+            utc_dates = sorted({fx["fixture"]["date"][:10] for _, fx in picked})
+            goal_index = goal_history.fetch_fixture_index(utc_dates)
+            print(f"goal-api fixture 索引：{len(goal_index)} 场"
+                  f"（UTC 日期 {', '.join(utc_dates)}）")
+        except goal_history.GoalApiError as e:
+            print(f"⚠️ goal-api fixture 索引失败（{e.kind}）：{e}；改为逐场解析 team id")
+        except Exception as e:
+            print(f"⚠️ goal-api fixture 索引异常：{type(e).__name__}；改为逐场解析 team id")
+
     rows, raws, history_cache = [], [], {}
+    compare_records = []
+    compare_done = 0
     counters = {}
     for cfg, fx in picked:
         fid = fx["fixture"]["id"]
@@ -333,20 +506,36 @@ def main():
             print(f"  无胜平负赔率 {desc}（跳过本场）")
             continue
 
+        hid = fx["teams"]["home"]["id"]
+        aid = fx["teams"]["away"]["id"]
+        hist_entry, hist_source, hist_err, hist_goal = _empty_history(), "none", None, None
+        if not args.no_history:
+            hist_entry, hist_source, hist_err, hist_goal = resolve_history(
+                str(fid), hid, aid, goal_index, source, _api_history_budget_ok(remaining))
+            history_cache[str(fid)] = hist_entry
+
+            if source == "compare" and compare_done < compare_n:
+                compare_done += 1
+                if hist_source == "api":
+                    api_entry, api_err = hist_entry, None
+                elif hist_source != "goal" or not _api_history_budget_ok(remaining):
+                    api_entry, api_err = None, "api_budget"
+                else:
+                    try:
+                        api_entry, api_err = fetch_history(hid, aid), None
+                    except Exception as e:
+                        api_entry, api_err = _empty_history(), f"api_failed:{type(e).__name__}"
+                goal_err = None if hist_source == "goal" else hist_err
+                compare_records.append(build_compare_record(
+                    number, fid, fx["teams"]["home"]["name"],
+                    fx["teams"]["away"]["name"], hist_goal, api_entry,
+                    goal_err, api_err))
+
         rows.append(build_row(fx, mapped, number, cfg))
         raws.append({"number": number, "fixture": fx, "odds_mapped": mapped,
-                     "odds_flags": flags})
-
-        if not args.no_history:
-            try:
-                hid = fx["teams"]["home"]["id"]
-                aid = fx["teams"]["away"]["id"]
-                season = fx.get("league", {}).get("season")
-                history_cache[str(fid)] = fetch_history(hid, aid, season)
-            except Exception as e:
-                print(f"  历史失败 {desc}: {e}（本场无历史）")
-                history_cache[str(fid)] = {"available": False}
-        print(f"  ✓ {desc}（累计请求 {_req_count}）")
+                     "odds_flags": flags, "history_source": hist_source,
+                     "history_error": hist_err})
+        print(f"  ✓ {desc}（累计请求 {_req_count}，历史={hist_source}）")
 
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = save_csv(rows, args.date, args.output_dir)
@@ -362,7 +551,12 @@ def main():
             json.dump(history_cache, fp, ensure_ascii=False, indent=2)
         print(f"历史缓存已保存：{hc_path}（{len(history_cache)} 场）")
 
-    print(f"本次共用 {_req_count} 次请求。")
+    if compare_records:
+        cmp_path = save_compare_report(compare_records, args.date, args.output_dir)
+        print(f"h2h 双源对照已保存：{cmp_path}（{len(compare_records)} 场）")
+
+    print(f"本次共用 API-Football {_req_count} 次请求，"
+          f"goal-api {goal_history.goal_request_count()} 次请求。")
 
 
 if __name__ == "__main__":
