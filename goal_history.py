@@ -10,8 +10,10 @@ available / home_recent_text / away_recent_text / h2h_text。
 时区：goal-api 自 2026-08-20 起全部时间为 UTC，文本展示统一转 Asia/Shanghai。
 """
 
+import difflib
 import os
 import re
+import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 
@@ -21,8 +23,12 @@ from football_history import summarize_h2h, summarize_recent
 
 GOAL_BASE = os.environ.get("GOAL_API_BASE", "https://api.goal-api.com/v1").rstrip("/")
 CST = timezone(timedelta(hours=8))
-HTTP_TIMEOUT = 20
-INDEX_PAGE_LIMIT = 500
+HTTP_TIMEOUT = 45  # 实测服务端约 0.16MB/s，limit=100 需 30s，20s 必然超时
+INDEX_PAGE_LIMIT = 100  # 实测上限 100（文档写 500，但 500 会 400）
+KICKOFF_WINDOW_MINUTES = 15  # 开球时间容差窗：两数据源开球时间常有分钟级偏差
+ROSTER_PAGE_LIMIT = 100
+HTTP_RETRIES = 3  # 仅对 timeout / network 重试（服务端约 12% 概率瞬断）
+RETRY_BACKOFF_SECONDS = 2
 
 _goal_req_count = 0
 
@@ -54,17 +60,31 @@ def get_goal_api_key():
 
 
 def goal_get(path, params=None, timeout=HTTP_TIMEOUT):
-    """GET goal-api，返回 data 字段；失败抛 GoalApiError，不记录 key。"""
+    """GET goal-api，返回 data 字段；失败抛 GoalApiError，不记录 key。
+
+    timeout / network 属瞬断（实测约 12%），自动退避重试；鉴权、配额、HTTP 错误不重试。
+    """
     global _goal_req_count
     url = f"{GOAL_BASE}/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {get_goal_api_key()}",
                "Accept": "application/json"}
-    try:
-        resp = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
-    except requests.Timeout as e:
-        raise GoalApiError("goal-api 请求超时", kind="timeout") from e
-    except requests.RequestException as e:
-        raise GoalApiError(f"goal-api 网络错误: {type(e).__name__}", kind="network") from e
+    resp = None
+    last_error = None
+    for attempt in range(HTTP_RETRIES):
+        try:
+            resp = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+            break
+        except requests.Timeout as e:
+            last_error = GoalApiError("goal-api 请求超时", kind="timeout")
+            last_error.__cause__ = e
+        except requests.RequestException as e:
+            last_error = GoalApiError(f"goal-api 网络错误: {type(e).__name__}", kind="network")
+            last_error.__cause__ = e
+        if attempt < HTTP_RETRIES - 1:
+            time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+    if resp is None:
+        _goal_req_count += HTTP_RETRIES
+        raise last_error
     _goal_req_count += 1
 
     if resp.status_code in (401, 403):
@@ -87,35 +107,77 @@ def goal_get(path, params=None, timeout=HTTP_TIMEOUT):
 
 # ---------------- fixture 索引与 team id 解析 ----------------
 
+def _kickoff_key(value):
+    """UTC kickoff -> 'YYYY-MM-DDTHH:MM'；容忍 'Z' / '+00:00' 两种写法。"""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+    except (ValueError, TypeError):
+        return None
+
+
+def _kickoff_dt(value):
+    """解析 UTC 开球时间为 datetime；裸字符串（索引键）按 UTC 处理，失败返回 None。"""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _name_match(a, b):
+    """规范化队名包含匹配（goal 与 API-Football 命名常缩写/加后缀）。"""
+    na, nb = _norm_name(a), _norm_name(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    return len(shorter) >= 4 and shorter in longer
+
+
+def _league_match(a, b):
+    """联赛名包含匹配，用于同开球时间的候选去歧义。"""
+    na, nb = _norm_name(a), _norm_name(b)
+    if not na or not nb:
+        return False
+    return na in nb or nb in na
+
+
 def _entry_from_fixture(item):
-    """goal-api Fixture -> {api_id, home_team_id, away_team_id, names}。"""
+    """goal-api Fixture -> {kickoff, home/away team id, names, league}。
+
+    注意：goal-api 的 apiId 与 API-Football fixture id 不同源（实测 404），
+    因此用「UTC 开球时间 + 队名/联赛名」作为映射键。
+    """
     if not isinstance(item, dict):
         return None
-    api_id = str(item.get("apiId") or "").strip()
     home = item.get("homeTeam") if isinstance(item.get("homeTeam"), dict) else {}
     away = item.get("awayTeam") if isinstance(item.get("awayTeam"), dict) else {}
     home_id = str(home.get("id") or item.get("homeTeamId") or "").strip()
     away_id = str(away.get("id") or item.get("awayTeamId") or "").strip()
-    if not api_id or not home_id or not away_id:
+    kickoff = _kickoff_key(item.get("kickoffUtc") or item.get("matchDate"))
+    if not kickoff or not home_id or not away_id:
         return None
     return {
-        "api_id": api_id,
+        "kickoff": kickoff,
         "home_team_id": home_id,
         "away_team_id": away_id,
-        "home_team_api_id": str(home.get("apiId") or "").strip(),
-        "away_team_api_id": str(away.get("apiId") or "").strip(),
         "home_name": str(home.get("name") or item.get("homeTeamName") or "").strip(),
         "away_name": str(away.get("name") or item.get("awayTeamName") or "").strip(),
+        "league_name": str(item.get("leagueName") or "").strip(),
     }
 
 
 def build_fixture_index(fixtures):
-    """把 fixture 列表转成 apiId -> team id 映射（纯函数，便于测试）。"""
+    """fixture 列表 -> {开球分钟: [候选条目]}，按名字/联赛在候选内消歧。"""
     index = {}
     for item in fixtures or []:
         entry = _entry_from_fixture(item)
         if entry:
-            index[entry["api_id"]] = entry
+            index.setdefault(entry["kickoff"], []).append(entry)
     return index
 
 
@@ -140,27 +202,143 @@ def fetch_fixture_index(target_dates):
     return index
 
 
-def fetch_single_fixture(match_id):
-    """按 API-Football fixture id 直查 goal-api fixture（apiId 可作为 fixture id）。"""
-    payload = goal_get(f"fixtures/{match_id}")
-    data = payload.get("data")
-    if isinstance(data, list):
-        data = data[0] if data else None
-    return _entry_from_fixture(data) if isinstance(data, dict) else None
+# ---------------- 联赛映射与球队名单（避免拉全天 353 场索引） ----------------
+
+# API-Football 联赛 id -> goal-api 联赛 cuid（2026-11-06 实测 /leagues?search 逐个核对）
+GOAL_LEAGUE_IDS = {
+    39:  "cmr77dvkr005nrx06lp7rvp49",   # Premier League / England
+    140: "cmr77dvnt006nrx063v3w622e",   # La Liga / Spain
+    135: "cmr77dvpd006yrx06zig7907g",   # Serie A / Italy
+    78:  "cmr77dvgm0002rx06rt2uqxii",   # Bundesliga / Germany
+    61:  "cmr77dvqg007crx06q1kaceyo",   # Ligue 1 / France
+    2:   "cmr77dw3900f5rx06j05wgzv4",   # UEFA Champions League
+    3:   "cmr77dw3900f6rx06tuqwft2d",   # UEFA Europa League
+    40:  "cmr77dvkr005hrx068xaahpuh",   # Championship / England
+    141: "cmr77dvnt006orx06io7l06lv",   # Segunda División / Spain
+    136: "cmr77dvpd006zrx06dmggkel8",   # Serie B / Italy
+    79:  "cmr77dvgm0001rx060h6ivt4p",   # 2. Bundesliga / Germany
+    62:  "cmr77dvqg007drx06q6y56j5u",   # Ligue 2 / France
+    848: "cmr77dw3900f9rx06laad8onf",   # UEFA Conference League
+    88:  "cmr77dvrh007vrx0664phtxs5",   # Eredivisie / Netherlands
+    94:  "cmr77dvun00adrx06xz20yfxe",   # Primeira Liga / Portugal
+    144: "cmr77dw9g00gvrx06jlglb47m",   # First Division A / Belgium
+    179: "cmr77dwe100j5rx064jkxo63c",   # Premiership / Scotland
+    203: "cmr77dw0q00eprx06rqew3m48",   # Süper Lig / Turkey
+    169: "cmr77dvlv0067rx06potai161",   # Chinese Super League
+    98:  "cmr77dx7h00rvrx060kholaxg",   # J1 League / Japan
+    292: "cmr77dvsf008lrx06l2d31exu",   # K League 1 / Korea Republic
+}
 
 
-def resolve_team_ids(match_id, index=None):
-    """返回 (home_goal_id, away_goal_id)；无法解析时返回 (None, None)。
+def league_goal_id(api_league_id):
+    """API-Football 联赛 id -> goal-api 联赛 cuid；未收录返回 None。"""
+    try:
+        return GOAL_LEAGUE_IDS.get(int(api_league_id))
+    except (TypeError, ValueError):
+        return None
 
-    fixture 索引未命中时按 API-Football fixture id 直查 goal-api；
-    鉴权/配额/网络异常向上抛出，交由调用方统一回退。
+
+def fetch_league_roster(goal_league_id):
+    """拉某联赛全部球队 -> [(队名, team_id)]。
+
+    /teams 响应约 11KB（对比 /fixtures/date 全天 183KB），是更稳的 team id 来源；
+    联赛名单赛季内稳定，调用方应缓存，避免每天重复拉取。
     """
-    entry = (index or {}).get(str(match_id))
-    if not entry:
-        entry = fetch_single_fixture(match_id)
-    if not entry:
+    teams = []
+    offset = 0
+    while True:
+        payload = goal_get("teams", {"leagueId": goal_league_id,
+                                     "limit": ROSTER_PAGE_LIMIT, "offset": offset})
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise GoalApiError("goal-api teams 返回 data 非列表", kind="parse")
+        teams.extend((str(t.get("name") or "").strip(), str(t.get("id") or "").strip())
+                     for t in data if isinstance(t, dict) and t.get("id"))
+        pagination = payload.get("pagination") or {}
+        if not pagination.get("hasMore"):
+            break
+        offset += len(data) or ROSTER_PAGE_LIMIT
+        if offset > 5000:
+            break
+    return [(n, i) for n, i in teams if n and i]
+
+
+def _roster_score(query, candidate):
+    """队名匹配分：精确 1.0；包含 0.9（Derby ⊂ Derby County）；相似度兜底。"""
+    q, c = _norm_name(query), _norm_name(candidate)
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 1.0
+    shorter, longer = (q, c) if len(q) <= len(c) else (c, q)
+    if len(shorter) >= 4 and shorter in longer:
+        return 0.9
+    return difflib.SequenceMatcher(None, q, c).ratio()
+
+
+def resolve_team_ids_from_roster(home_name, away_name, roster, threshold=0.72):
+    """用联赛球队名单解析双方 goal team id（不依赖开球时间）。
+
+    goal 队名常缩写（Borussia M'gladbach / Coventry City / Bolton Wanderers），
+    包含匹配优先、相似度兜底；主客必须落到不同 team id，否则视为失败。
+    """
+    if not roster:
         return None, None
-    return entry.get("home_team_id"), entry.get("away_team_id")
+
+    def pick(name):
+        best_score, best_id = 0.0, None
+        for cand_name, cand_id in roster:
+            score = _roster_score(name, cand_name)
+            if score > best_score:
+                best_score, best_id = score, cand_id
+        return best_score, best_id
+
+    hs, hid = pick(home_name)
+    as_, aid = pick(away_name)
+    if hs < threshold or as_ < threshold or not hid or not aid or hid == aid:
+        return None, None
+    return hid, aid
+
+
+def resolve_team_ids(kickoff_utc, home_name, away_name, league_name, index=None):
+    """在 goal-api fixture 索引中解析双方 team id。
+
+    三重匹配：
+    1. 开球时间落在 ±KICKOFF_WINDOW_MINUTES 容差窗内（两数据源开球时间常有分钟级偏差）；
+    2. 主客队名包含匹配，主客双向都试（goal-api 主客顺序偶尔相反），正向优先于互换；
+    3. 联赛名包含匹配作为同时候选的加分项。
+    平分取时间差更小者。解析不到返回 (None, None)；命中互换时按查询侧主客视角换回 id。
+    """
+    target = _kickoff_dt(kickoff_utc)
+    if target is None:
+        return None, None
+    scored = []
+    for key, entries in (index or {}).items():
+        cand_dt = _kickoff_dt(key)
+        if cand_dt is None:
+            continue
+        minutes = abs((cand_dt - target).total_seconds()) / 60
+        if minutes > KICKOFF_WINDOW_MINUTES:
+            continue
+        for entry in entries:
+            direct = (_name_match(entry.get("home_name"), home_name)
+                      and _name_match(entry.get("away_name"), away_name))
+            swapped = (_name_match(entry.get("home_name"), away_name)
+                       and _name_match(entry.get("away_name"), home_name))
+            if not (direct or swapped):
+                continue
+            score = 2 if direct else 0
+            if _league_match(entry.get("league_name"), league_name):
+                score += 1
+            scored.append((score, -minutes, direct, entry))
+    if not scored:
+        return None, None
+    # sort 稳定：前三项打平时保留索引内原始顺序，避免比较 dict
+    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    _, _, direct, best = scored[0]
+    if direct:
+        return best.get("home_team_id"), best.get("away_team_id")
+    return best.get("away_team_id"), best.get("home_team_id")
 
 
 # ---------------- h2h 响应解析 ----------------
@@ -273,13 +451,20 @@ def parse_h2h_payload(payload, home_name=None, away_name=None):
     }
 
 
-def fetch_history_goal(match_id, home_api_id, away_api_id, index=None,
-                       home_name=None, away_name=None):
+def fetch_history_goal(kickoff_utc, home_name, away_name, league_name,
+                       index=None, roster=None):
     """一次 /h2h 请求同时取回双方近况 + 直接交锋。
 
-    home_api_id/away_api_id 仅用于团队解析/日志，不参与 h2h 归属判定。
+    roster（联赛球队名单）是主路径，不依赖开球时间，命中率更高；
+    未命中再回退到开球时间 ±容差窗的 fixture 索引。
     """
-    home_goal_id, away_goal_id = resolve_team_ids(match_id, index)
+    home_goal_id, away_goal_id = (None, None)
+    if roster:
+        home_goal_id, away_goal_id = resolve_team_ids_from_roster(
+            home_name, away_name, roster)
+    if not home_goal_id or not away_goal_id:
+        home_goal_id, away_goal_id = resolve_team_ids(
+            kickoff_utc, home_name, away_name, league_name, index)
     if not home_goal_id or not away_goal_id:
         raise GoalApiError("goal-api 无法解析双方 team id", kind="mapping")
     payload = goal_get(f"h2h/{home_goal_id}/{away_goal_id}")

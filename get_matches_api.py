@@ -135,6 +135,87 @@ def _api_history_budget_ok(remaining):
     return remaining - RESULTS_RESERVE - _req_count >= 1
 
 
+# ---------------- goal-api 联赛球队名单（team id 映射，带缓存） ----------------
+
+GOAL_ROSTER_CACHE = "goal_rosters.json"
+GOAL_ROSTER_TTL_DAYS = 7  # 联赛球队名单赛季内稳定，7 天后刷新
+
+
+def _read_roster_cache(path):
+    try:
+        with open(path, encoding="utf-8") as fp:
+            payload = json.load(fp)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _roster_entry_teams(entry):
+    teams = (entry or {}).get("teams")
+    if not isinstance(teams, list):
+        return []
+    out = []
+    for t in teams:
+        if isinstance(t, (list, tuple)) and len(t) == 2 and t[0] and t[1]:
+            out.append((str(t[0]), str(t[1])))
+    return out
+
+
+def load_or_fetch_goal_rosters(picked, output_dir, refresh=False):
+    """按联赛拉 goal 球队名单并缓存，返回 {str(API联赛id): [(队名, team_id)]}。
+
+    命中核心：/teams?leagueId= 响应约 11KB（全天赛程索引 183KB），缓存后每日零索引请求；
+    单个联赛失败不影响其他联赛，且失败时沿用旧缓存。
+    """
+    path = os.path.join(output_dir, GOAL_ROSTER_CACHE)
+    cache = {} if refresh else _read_roster_cache(path)
+    leagues = cache.get("leagues") if isinstance(cache.get("leagues"), dict) else {}
+    try:
+        age = (date.today() - date.fromisoformat(str(cache.get("updated")))).days
+        fresh = 0 <= age < GOAL_ROSTER_TTL_DAYS
+    except (TypeError, ValueError):
+        fresh = False
+
+    league_ids = []
+    for _, fx in picked:
+        lid = (fx.get("league") or {}).get("id")
+        if lid is not None and int(lid) not in league_ids:
+            league_ids.append(int(lid))
+
+    rosters, changed = {}, False
+    for lid in league_ids:
+        key = str(lid)
+        cached_teams = _roster_entry_teams(leagues.get(key))
+        if fresh and cached_teams:
+            rosters[key] = cached_teams
+            continue
+        goal_id = goal_history.league_goal_id(lid)
+        if not goal_id:
+            print(f"  ⚠️ 联赛 {lid} 未收录 goal 映射，跳过 team id 名单")
+            continue
+        try:
+            teams = goal_history.fetch_league_roster(goal_id)
+        except goal_history.GoalApiError as e:
+            print(f"  ⚠️ goal-api 球队名单失败（联赛 {lid}，{e.kind}）：{e}")
+            if cached_teams:
+                rosters[key] = cached_teams
+            continue
+        if teams:
+            rosters[key] = teams
+            leagues[key] = {"goal_id": goal_id,
+                            "teams": [[n, i] for n, i in teams]}
+            changed = True
+
+    if changed or not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump({"updated": str(date.today()), "leagues": leagues},
+                          fp, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"  ⚠️ goal 球队名单缓存写入失败：{type(e).__name__}")
+    return rosters
+
+
 # ---------------- 赔率映射 ----------------
 
 def _bet_list(odds_resp):
@@ -265,7 +346,8 @@ def _empty_history():
             "available": False}
 
 
-def resolve_history(match_id, home_id, away_id, index, source, can_spend_api):
+def resolve_history(kickoff_utc, home_name, away_name, league_name,
+                    home_api_id, away_api_id, index, source, can_spend_api, roster=None):
     """按开关取历史，返回 (entry, 来源标签, 错误类型, goal 原始结果)。
 
     来源标签写入 _raw.json 的 history_source：
@@ -276,7 +358,8 @@ def resolve_history(match_id, home_id, away_id, index, source, can_spend_api):
     goal_entry = None
     if source in ("goal", "compare"):
         try:
-            goal_entry = goal_history.fetch_history_goal(match_id, home_id, away_id, index)
+            goal_entry = goal_history.fetch_history_goal(
+                kickoff_utc, home_name, away_name, league_name, index, roster)
             if goal_entry.get("available"):
                 return goal_entry, "goal", None, goal_entry
             err = "empty"
@@ -289,7 +372,7 @@ def resolve_history(match_id, home_id, away_id, index, source, can_spend_api):
         return _empty_history(), "none", err or "api_budget", goal_entry
 
     try:
-        return fetch_history(home_id, away_id), "api", err, goal_entry
+        return fetch_history(home_api_id, away_api_id), "api", err, goal_entry
     except Exception as e:
         return _empty_history(), "none", err or f"api_failed:{type(e).__name__}", goal_entry
 
@@ -473,17 +556,26 @@ def main():
               f"预留 {RESULTS_RESERVE} 给赛果）。")
         picked = picked[:max_matches]
 
-    goal_index = {}
+    goal_index, goal_rosters = {}, {}
     if not args.no_history and source in ("goal", "compare"):
         try:
-            utc_dates = sorted({fx["fixture"]["date"][:10] for _, fx in picked})
-            goal_index = goal_history.fetch_fixture_index(utc_dates)
-            print(f"goal-api fixture 索引：{len(goal_index)} 场"
-                  f"（UTC 日期 {', '.join(utc_dates)}）")
-        except goal_history.GoalApiError as e:
-            print(f"⚠️ goal-api fixture 索引失败（{e.kind}）：{e}；改为逐场解析 team id")
+            goal_rosters = load_or_fetch_goal_rosters(picked, args.output_dir)
         except Exception as e:
-            print(f"⚠️ goal-api fixture 索引异常：{type(e).__name__}；改为逐场解析 team id")
+            print(f"⚠️ goal-api 球队名单异常：{type(e).__name__}；回退 fixture 索引")
+            goal_rosters = {}
+        if goal_rosters:
+            print(f"goal-api 球队名单：{len(goal_rosters)} 个联赛"
+                  f"（覆盖 {len(picked)} 场，零全天索引请求）")
+        else:
+            try:
+                utc_dates = sorted({fx["fixture"]["date"][:10] for _, fx in picked})
+                goal_index = goal_history.fetch_fixture_index(utc_dates)
+                print(f"goal-api fixture 索引：{len(goal_index)} 场"
+                      f"（UTC 日期 {', '.join(utc_dates)}）")
+            except goal_history.GoalApiError as e:
+                print(f"⚠️ goal-api fixture 索引失败（{e.kind}）：{e}；改为逐场解析 team id")
+            except Exception as e:
+                print(f"⚠️ goal-api fixture 索引异常：{type(e).__name__}；改为逐场解析 team id")
 
     rows, raws, history_cache = [], [], {}
     compare_records = []
@@ -508,16 +600,23 @@ def main():
 
         hid = fx["teams"]["home"]["id"]
         aid = fx["teams"]["away"]["id"]
-        hist_entry, hist_source, hist_err, hist_goal = _empty_history(), "none", None, None
+        history_entry, hist_source, hist_err, hist_goal = _empty_history(), "none", None, None
+        hist_kickoff = fx["fixture"]["date"]
+        hist_home = fx["teams"]["home"]["name"]
+        hist_away = fx["teams"]["away"]["name"]
+        hist_league = fx.get("league", {}).get("name", "")
+        hist_league_id = (fx.get("league") or {}).get("id")
         if not args.no_history:
-            hist_entry, hist_source, hist_err, hist_goal = resolve_history(
-                str(fid), hid, aid, goal_index, source, _api_history_budget_ok(remaining))
-            history_cache[str(fid)] = hist_entry
+            history_entry, hist_source, hist_err, hist_goal = resolve_history(
+                hist_kickoff, hist_home, hist_away, hist_league, hid, aid,
+                goal_index, source, _api_history_budget_ok(remaining),
+                roster=goal_rosters.get(str(hist_league_id)))
+            history_cache[str(fid)] = history_entry
 
             if source == "compare" and compare_done < compare_n:
                 compare_done += 1
                 if hist_source == "api":
-                    api_entry, api_err = hist_entry, None
+                    api_entry, api_err = history_entry, None
                 elif hist_source != "goal" or not _api_history_budget_ok(remaining):
                     api_entry, api_err = None, "api_budget"
                 else:

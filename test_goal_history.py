@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 # 其他测试可能为便携运行注入 football_history 桩；这里恢复真实模块后再导入适配层。
@@ -138,30 +139,121 @@ class TestGoalGet(unittest.TestCase):
 
 
 class TestFixtureIndexAndTeamMapping(unittest.TestCase):
-    def test_build_index_prefers_nested_team_ids(self):
+    def test_build_index_groups_by_kickoff_minute(self):
         fixtures = [
-            {"apiId": "746486",
-             "homeTeam": {"id": "g-100", "apiId": "100", "name": "Home"},
-             "awayTeam": {"id": "g-200", "apiId": "200", "name": "Away"}},
-            {"apiId": "746490", "homeTeamId": "g-300", "awayTeamId": "g-400",
-             "homeTeamName": "H2", "awayTeamName": "A2"},
-            {"apiId": "", "homeTeamId": "x", "awayTeamId": "y"},
+            {"kickoffUtc": "2026-11-05T17:45:00.000Z",
+             "homeTeam": {"id": "g-100", "name": "AC Milan"},
+             "awayTeam": {"id": "g-200", "name": "Ferencvaros"},
+             "leagueName": "UEFA Europa League - League Phase"},
+            {"kickoffUtc": "2026-11-05T20:00:00Z", "homeTeamId": "g-300",
+             "awayTeamId": "g-400", "homeTeamName": "H2", "awayTeamName": "A2"},
+            {"kickoffUtc": "bad", "homeTeamId": "x", "awayTeamId": "y"},
         ]
         idx = goal_history.build_fixture_index(fixtures)
-        self.assertEqual(set(idx), {"746486", "746490"})
-        self.assertEqual(idx["746486"]["home_team_id"], "g-100")
-        self.assertEqual(idx["746490"]["away_team_id"], "g-400")
+        self.assertEqual(set(idx), {"2026-11-05T17:45", "2026-11-05T20:00"})
+        self.assertEqual(idx["2026-11-05T17:45"][0]["home_team_id"], "g-100")
+        self.assertEqual(idx["2026-11-05T20:00"][0]["away_team_id"], "g-400")
 
-    def test_resolve_team_ids_from_index_uses_api_fixture_id(self):
-        idx = {"746486": {"home_team_id": "g-100", "away_team_id": "g-200"}}
-        with patch.object(goal_history, "fetch_single_fixture",
-                          side_effect=AssertionError("不应发请求")):
-            home, away = goal_history.resolve_team_ids("746486", idx)
+    def test_resolve_team_ids_fuzzy_names_and_kickoff(self):
+        idx = {"2026-11-05T17:45": [
+            {"home_team_id": "g-100", "away_team_id": "g-200",
+             "home_name": "AC Milan", "away_name": "Ferencvaros",
+             "league_name": "UEFA Europa League - League Phase"}]}
+        home, away = goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00+00:00", "AC Milan", "Ferencvarosi TC",
+            "UEFA Europa League", idx)
         self.assertEqual((home, away), ("g-100", "g-200"))
 
+    def test_resolve_team_ids_league_breaks_tie(self):
+        idx = {"2026-11-05T17:45": [
+            {"home_team_id": "x1", "away_team_id": "x2", "home_name": "Milan",
+             "away_name": "Inter", "league_name": "Serie A"},
+            {"home_team_id": "g-100", "away_team_id": "g-200", "home_name": "AC Milan",
+             "away_name": "Inter", "league_name": "UEFA Europa League"}]}
+        home, _ = goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00Z", "AC Milan", "Inter", "UEFA Europa League", idx)
+        self.assertEqual(home, "g-100")
+
     def test_resolve_team_ids_unmapped_returns_none(self):
-        with patch.object(goal_history, "fetch_single_fixture", return_value=None):
-            self.assertEqual(goal_history.resolve_team_ids("999", {}), (None, None))
+        self.assertEqual(goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00Z", "Home", "Away", "L", {}), (None, None))
+
+    def test_index_page_limit_within_real_api_max(self):
+        # 实测 /fixtures/date 的 limit 上限为 100（文档 500 会返回 400）
+        self.assertLessEqual(goal_history.INDEX_PAGE_LIMIT, 100)
+
+    def test_goal_api_id_is_not_used_as_key(self):
+        # 实测 goal-api apiId 与 API-Football fixture id 不同源，索引不再按 apiId
+        idx = goal_history.build_fixture_index(
+            [{"apiId": "1636208", "kickoffUtc": "2026-11-05T17:45:00Z",
+              "homeTeam": {"id": "g1", "name": "A"}, "awayTeam": {"id": "g2", "name": "B"}}])
+        self.assertNotIn("1636208", idx)
+        self.assertIn("2026-11-05T17:45", idx)
+
+    def test_resolve_team_ids_within_kickoff_window(self):
+        # 两数据源开球时间差 2 分钟，容差窗内应命中
+        idx = {"2026-11-05T17:47": [
+            {"home_team_id": "g-100", "away_team_id": "g-200",
+             "home_name": "AC Milan", "away_name": "Ferencvaros",
+             "league_name": "UEFA Europa League"}]}
+        home, away = goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00+00:00", "AC Milan", "Ferencvaros",
+            "UEFA Europa League", idx)
+        self.assertEqual((home, away), ("g-100", "g-200"))
+
+    def test_resolve_team_ids_window_boundary_and_outside(self):
+        entry = {"home_team_id": "g-100", "away_team_id": "g-200",
+                 "home_name": "AC Milan", "away_name": "Ferencvaros",
+                 "league_name": "L"}
+        idx_in = {"2026-11-05T18:00": [entry]}   # 恰好 15 分钟，边界内
+        idx_out = {"2026-11-05T18:01": [entry]}  # 16 分钟，窗外
+        self.assertEqual(goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00Z", "AC Milan", "Ferencvaros", "L", idx_in),
+            ("g-100", "g-200"))
+        self.assertEqual(goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00Z", "AC Milan", "Ferencvaros", "L", idx_out),
+            (None, None))
+
+    def test_resolve_team_ids_swapped_home_away(self):
+        # goal-api 主客顺序相反时应按查询侧视角换回 id
+        idx = {"2026-11-05T17:45": [
+            {"home_team_id": "g-200", "away_team_id": "g-100",
+             "home_name": "Ferencvaros", "away_name": "AC Milan",
+             "league_name": "UEFA Europa League"}]}
+        home, away = goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00Z", "AC Milan", "Ferencvarosi TC",
+            "UEFA Europa League", idx)
+        self.assertEqual((home, away), ("g-100", "g-200"))
+
+    def test_resolve_team_ids_prefers_direct_over_swapped(self):
+        # 互换候选（0 分钟）与正向候选（5 分钟）并存时，正向优先
+        idx = {
+            "2026-11-05T17:45": [
+                {"home_team_id": "s-away", "away_team_id": "s-home",
+                 "home_name": "Ferencvaros", "away_name": "AC Milan",
+                 "league_name": "UEFA Europa League"}],
+            "2026-11-05T17:50": [
+                {"home_team_id": "g-100", "away_team_id": "g-200",
+                 "home_name": "AC Milan", "away_name": "Ferencvaros",
+                 "league_name": "UEFA Europa League"}],
+        }
+        home, away = goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00Z", "AC Milan", "Ferencvaros",
+            "UEFA Europa League", idx)
+        self.assertEqual((home, away), ("g-100", "g-200"))
+
+    def test_resolve_team_ids_prefers_closer_kickoff_on_score_tie(self):
+        # 同为正向同分时，取时间差更小者
+        far = {"home_team_id": "far-h", "away_team_id": "far-a",
+               "home_name": "AC Milan", "away_name": "Ferencvaros",
+               "league_name": "Other League"}
+        near = {"home_team_id": "g-100", "away_team_id": "g-200",
+                "home_name": "AC Milan", "away_name": "Ferencvaros",
+                "league_name": "Other League"}
+        idx = {"2026-11-05T17:55": [far], "2026-11-05T17:46": [near]}
+        home, away = goal_history.resolve_team_ids(
+            "2026-11-05T17:45:00Z", "AC Milan", "Ferencvaros", "L", idx)
+        self.assertEqual((home, away), ("g-100", "g-200"))
 
 
 class TestParseH2H(unittest.TestCase):
@@ -218,13 +310,16 @@ class TestParseH2H(unittest.TestCase):
         self.assertEqual(ctx.exception.kind, "parse")
 
 
+KICKOFF = "2026-11-05T11:00:00+00:00"
+
+
 class TestResolveHistoryFallback(unittest.TestCase):
     def test_goal_success_does_not_touch_api(self):
         with patch("get_matches_api.goal_history.fetch_history_goal",
                    return_value={"available": True, "home_recent_text": "g"}), \
              patch("get_matches_api.fetch_history",
                    side_effect=AssertionError("不应回退")):
-            entry, src, err, _ = gma.resolve_history("1", 100, 200, {}, "goal", True)
+            entry, src, err, _ = gma.resolve_history(KICKOFF, "Home", "Away", "L", 100, 200, {}, "goal", True)
         self.assertEqual(src, "goal")
         self.assertTrue(entry["available"])
         self.assertIsNone(err)
@@ -234,7 +329,7 @@ class TestResolveHistoryFallback(unittest.TestCase):
                    side_effect=goal_history.GoalApiError("x", kind="quota")), \
              patch("get_matches_api.fetch_history",
                    return_value={"available": True, "home_recent_text": "api"}):
-            entry, src, err, _ = gma.resolve_history("1", 100, 200, {}, "goal", True)
+            entry, src, err, _ = gma.resolve_history(KICKOFF, "Home", "Away", "L", 100, 200, {}, "goal", True)
         self.assertEqual(src, "api")
         self.assertEqual(err, "quota")
         self.assertEqual(entry["home_recent_text"], "api")
@@ -245,7 +340,7 @@ class TestResolveHistoryFallback(unittest.TestCase):
         with patch("get_matches_api.goal_history.fetch_history_goal", return_value=empty), \
              patch("get_matches_api.fetch_history",
                    return_value={"available": True, "home_recent_text": "api"}):
-            entry, src, err, goal_raw = gma.resolve_history("1", 100, 200, {}, "goal", True)
+            entry, src, err, goal_raw = gma.resolve_history(KICKOFF, "Home", "Away", "L", 100, 200, {}, "goal", True)
         self.assertEqual(src, "api")
         self.assertEqual(err, "empty")
         self.assertFalse(goal_raw["available"])
@@ -256,7 +351,7 @@ class TestResolveHistoryFallback(unittest.TestCase):
                    side_effect=goal_history.GoalApiError("x", kind="timeout")), \
              patch("get_matches_api.fetch_history",
                    side_effect=AssertionError("不应回退")):
-            entry, src, err, _ = gma.resolve_history("1", 100, 200, {}, "goal", False)
+            entry, src, err, _ = gma.resolve_history(KICKOFF, "Home", "Away", "L", 100, 200, {}, "goal", False)
         self.assertEqual(src, "none")
         self.assertEqual(err, "timeout")
         self.assertFalse(entry["available"])
@@ -266,14 +361,14 @@ class TestResolveHistoryFallback(unittest.TestCase):
                    side_effect=AssertionError("不应调用")), \
              patch("get_matches_api.fetch_history",
                    return_value={"available": True}):
-            entry, src, err, _ = gma.resolve_history("1", 100, 200, {}, "api", True)
+            entry, src, err, _ = gma.resolve_history(KICKOFF, "Home", "Away", "L", 100, 200, {}, "api", True)
         self.assertEqual(src, "api")
 
     def test_unexpected_goal_error_is_contained(self):
         with patch("get_matches_api.goal_history.fetch_history_goal",
                    side_effect=KeyError("boom")), \
              patch("get_matches_api.fetch_history", return_value={"available": True}):
-            entry, src, err, _ = gma.resolve_history("1", 100, 200, {}, "goal", True)
+            entry, src, err, _ = gma.resolve_history(KICKOFF, "Home", "Away", "L", 100, 200, {}, "goal", True)
         self.assertEqual(src, "api")
         self.assertIn("unexpected:KeyError", err)
 
@@ -359,9 +454,12 @@ class TestMainFlowOffline(unittest.TestCase):
                 patch.object(gma, "get_remaining", return_value=100), \
                 patch.object(gma, "api_get", side_effect=fake_api_get), \
                 patch.object(gma, "_req_count", 0), \
+                patch.object(gma, "load_or_fetch_goal_rosters", return_value={}), \
                 patch("get_matches_api.goal_history.fetch_fixture_index",
-                      return_value={"746486": {"home_team_id": "g-100",
-                                               "away_team_id": "g-200"}}), \
+                      return_value={"2026-11-05T11:00": [
+                          {"home_team_id": "g-100", "away_team_id": "g-200",
+                           "home_name": "Home", "away_name": "Away",
+                           "league_name": "Premier League"}]}), \
                 patch("get_matches_api.goal_history.fetch_history_goal",
                       return_value=goal_entry), \
                 patch("get_matches_api.fetch_history", return_value=api_entry):
@@ -403,6 +501,160 @@ class TestCsvContractUnchanged(unittest.TestCase):
         self.assertNotIn("history_source", row)
         self.assertIn("matchId", row)
         self.assertEqual(row["让球数"], "")
+
+
+class TestGoalGetRetry(unittest.TestCase):
+    def test_timeout_then_success(self):
+        ok = FakeResponse(200, {"success": True, "data": [1]})
+        with _env(), patch.object(goal_history.time, "sleep"), \
+                patch.object(goal_history.requests, "get",
+                             side_effect=[goal_history.requests.Timeout("t"), ok]) as g:
+            out = goal_history.goal_get("h2h/a/b")
+        self.assertEqual(out, {"success": True, "data": [1]})
+        self.assertEqual(g.call_count, 2)
+
+    def test_retries_exhausted_raises_timeout(self):
+        with _env(), patch.object(goal_history.time, "sleep"), \
+                patch.object(goal_history.requests, "get",
+                             side_effect=goal_history.requests.Timeout("t")) as g:
+            with self.assertRaises(goal_history.GoalApiError) as ctx:
+                goal_history.goal_get("h2h/a/b")
+        self.assertEqual(ctx.exception.kind, "timeout")
+        self.assertEqual(g.call_count, goal_history.HTTP_RETRIES)
+
+    def test_auth_error_not_retried(self):
+        with _env(), patch.object(goal_history.requests, "get",
+                                  return_value=FakeResponse(401, {})) as g:
+            with self.assertRaises(goal_history.GoalApiError):
+                goal_history.goal_get("h2h/a/b")
+        self.assertEqual(g.call_count, 1)
+
+
+class TestLeagueGoalIdMap(unittest.TestCase):
+    def test_all_whitelisted_leagues_have_goal_id(self):
+        from leagues_config import LEAGUES
+        for lg in LEAGUES:
+            self.assertIsNotNone(goal_history.league_goal_id(lg["api_id"]),
+                                 f"缺映射：{lg['name']}")
+
+    def test_goal_ids_unique(self):
+        ids = list(goal_history.GOAL_LEAGUE_IDS.values())
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_unknown_league_returns_none(self):
+        self.assertIsNone(goal_history.league_goal_id(99999))
+        self.assertIsNone(goal_history.league_goal_id(None))
+
+
+class TestRosterMapping(unittest.TestCase):
+    ROSTER = [("Everton", "g-ev"), ("Coventry City", "g-cov"),
+              ("Hamburger SV", "g-hsv"), ("Borussia M'gladbach", "g-bmg"),
+              ("Derby County", "g-der"), ("Bolton Wanderers", "g-bol"),
+              ("Red Star", "g-red"), ("Toulouse", "g-tou")]
+
+    def test_contains_match_for_short_names(self):
+        # 实测 API-Football 简称 Derby / Bolton，goal 全称 Derby County / Bolton Wanderers
+        self.assertEqual(goal_history.resolve_team_ids_from_roster(
+            "Derby", "Bolton", self.ROSTER), ("g-der", "g-bol"))
+
+    def test_abbreviated_club_name_similarity(self):
+        self.assertEqual(goal_history.resolve_team_ids_from_roster(
+            "Borussia Mönchengladbach", "Hamburger SV", self.ROSTER),
+            ("g-bmg", "g-hsv"))
+
+    def test_suffix_variant(self):
+        self.assertEqual(goal_history.resolve_team_ids_from_roster(
+            "Everton", "Coventry", self.ROSTER), ("g-ev", "g-cov"))
+
+    def test_same_team_rejected(self):
+        self.assertEqual(goal_history.resolve_team_ids_from_roster(
+            "Everton", "Everton", self.ROSTER), (None, None))
+
+    def test_empty_roster(self):
+        self.assertEqual(goal_history.resolve_team_ids_from_roster(
+            "A", "B", []), (None, None))
+
+    def test_low_similarity_rejected(self):
+        self.assertEqual(goal_history.resolve_team_ids_from_roster(
+            "Zenit", "Krasnodar", self.ROSTER), (None, None))
+
+
+class TestFetchLeagueRoster(unittest.TestCase):
+    def test_pagination_and_parse(self):
+        pages = [
+            FakeResponse(200, {"success": True, "pagination": {"hasMore": True},
+                               "data": [{"name": "A", "id": "g-a"}]}),
+            FakeResponse(200, {"success": True, "pagination": {"hasMore": False},
+                               "data": [{"name": "B", "id": "g-b"}]}),
+        ]
+        with _env(), patch.object(goal_history.requests, "get", side_effect=pages):
+            roster = goal_history.fetch_league_roster("lg-x")
+        self.assertEqual(roster, [("A", "g-a"), ("B", "g-b")])
+
+    def test_non_list_data_is_parse_error(self):
+        with _env(), patch.object(goal_history.requests, "get",
+                                  return_value=FakeResponse(200, {"success": True, "data": {}})):
+            with self.assertRaises(goal_history.GoalApiError) as ctx:
+                goal_history.fetch_league_roster("lg-x")
+        self.assertEqual(ctx.exception.kind, "parse")
+
+
+class TestFetchHistoryGoalRosterFirst(unittest.TestCase):
+    def test_roster_hit_skips_index(self):
+        roster = [("Home", "g-h"), ("Away", "g-a")]
+        with _env(), patch.object(goal_history, "goal_get",
+                                  return_value=_h2h_payload()) as g, \
+                patch.object(goal_history, "resolve_team_ids",
+                             side_effect=AssertionError("roster 命中时不应查索引")):
+            out = goal_history.fetch_history_goal(KICKOFF, "Home", "Away", "L", None, roster)
+        self.assertTrue(out["available"])
+        self.assertEqual(g.call_args.args[0], "h2h/g-h/g-a")
+
+    def test_roster_miss_falls_back_to_index(self):
+        roster = [("Other", "g-o"), ("Another", "g-x")]
+        idx = {"2026-11-05T11:00": [{"home_team_id": "i-h", "away_team_id": "i-a",
+                                     "home_name": "Home XI", "away_name": "Away XI",
+                                     "league_name": "L"}]}
+        with _env(), patch.object(goal_history, "goal_get",
+                                  return_value=_h2h_payload()) as g:
+            goal_history.fetch_history_goal(KICKOFF, "Home XI", "Away XI", "L", idx, roster)
+        self.assertEqual(g.call_args.args[0], "h2h/i-h/i-a")
+
+
+class TestRosterCache(unittest.TestCase):
+    def test_cache_hit_avoids_network(self):
+        picked = [(None, {"league": {"id": 39}})]
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, gma.GOAL_ROSTER_CACHE), "w", encoding="utf-8") as fp:
+                json.dump({"updated": str(date.today()),
+                           "leagues": {"39": {"goal_id": "lg",
+                                              "teams": [["Everton", "g-e"]]}}}, fp)
+            with patch.object(gma.goal_history, "fetch_league_roster",
+                              side_effect=AssertionError("缓存已命中，不应请求")):
+                rosters = gma.load_or_fetch_goal_rosters(picked, td)
+        self.assertEqual(rosters["39"], [("Everton", "g-e")])
+
+    def test_cache_miss_fetches_and_writes(self):
+        picked = [(None, {"league": {"id": 39}})]
+        with tempfile.TemporaryDirectory() as td, \
+                patch.object(gma.goal_history, "fetch_league_roster",
+                             return_value=[("Everton", "g-e")]) as f:
+            rosters = gma.load_or_fetch_goal_rosters(picked, td)
+            self.assertEqual(rosters["39"], [("Everton", "g-e")])
+            self.assertTrue(os.path.exists(os.path.join(td, gma.GOAL_ROSTER_CACHE)))
+        self.assertEqual(f.call_count, 1)
+
+    def test_stale_cache_refetches(self):
+        picked = [(None, {"league": {"id": 39}})]
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, gma.GOAL_ROSTER_CACHE), "w", encoding="utf-8") as fp:
+                json.dump({"updated": "2020-01-01",
+                           "leagues": {"39": {"goal_id": "lg",
+                                              "teams": [["Old", "g-old"]]}}}, fp)
+            with patch.object(gma.goal_history, "fetch_league_roster",
+                              return_value=[("New", "g-new")]):
+                rosters = gma.load_or_fetch_goal_rosters(picked, td)
+        self.assertEqual(rosters["39"], [("New", "g-new")])
 
 
 if __name__ == "__main__":

@@ -28,6 +28,14 @@ for V in DEEPSEEK_API_KEY FOOTBALL_API_KEY; do
     fi
 done
 
+# h2h 走 goal-api（默认 compare）时 GOAL_API_KEY 必填：提前在启动阶段拦截，
+# 避免跑到第 1 步 get_matches_api.py 才 fail-fast
+H2H_SRC="${H2H_SOURCE:-compare}"
+if [ "$H2H_SRC" != "api" ] && [ -z "$GOAL_API_KEY" ]; then
+    echo "❌ 错误：环境变量 GOAL_API_KEY 未设置（H2H_SOURCE=$H2H_SRC 需要 goal-api；请写入 ~/.zshrc 后 source）"
+    exit 1
+fi
+
 FAILED_STEPS=()
 run_step() {
     local label="$1"; shift
