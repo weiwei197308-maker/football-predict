@@ -51,6 +51,23 @@ HAFU_VALUE_MAP = {
 HAFU_KEYS = list(HAFU_VALUE_MAP.values())
 
 _req_count = 0
+_last_api_call_at = 0.0
+# Free 计划限 10 次/分钟（6s/次）。稳定优先：取 8s（约 7.5 次/分钟），
+# 给计数窗口抖动留更大余量，宁可慢也不让白名单场次被 429 跳过。
+# 每次请求（含 429 重试）前保证最小间隔。设为 0 可关闭节流。
+API_MIN_INTERVAL_SECONDS = 8.0
+
+
+def _throttle_api():
+    """保证两次 API-Football 请求间隔不小于 API_MIN_INTERVAL_SECONDS。"""
+    global _last_api_call_at
+    if API_MIN_INTERVAL_SECONDS <= 0:
+        return
+    now = time.monotonic()
+    wait = API_MIN_INTERVAL_SECONDS - (now - _last_api_call_at)
+    if _last_api_call_at and wait > 0:
+        time.sleep(wait)
+    _last_api_call_at = time.monotonic()
 
 
 def _key():
@@ -64,6 +81,7 @@ def api_get(path, params):
     global _req_count
     resp = None
     for attempt in range(4):
+        _throttle_api()
         resp = requests.get(
             f"{BASE}/{path}", params=params,
             headers={"x-apisports-key": _key()}, timeout=20,

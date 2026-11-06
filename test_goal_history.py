@@ -503,6 +503,38 @@ class TestCsvContractUnchanged(unittest.TestCase):
         self.assertEqual(row["让球数"], "")
 
 
+class TestApiThrottle(unittest.TestCase):
+    def test_first_call_no_sleep(self):
+        with patch.object(gma, "_last_api_call_at", 0.0), \
+                patch.object(gma.time, "monotonic", return_value=100.0), \
+                patch.object(gma.time, "sleep") as sl:
+            gma._throttle_api()
+        sl.assert_not_called()
+
+    def test_second_call_sleeps_remaining_gap(self):
+        with patch.object(gma, "API_MIN_INTERVAL_SECONDS", 1.0), \
+                patch.object(gma, "_last_api_call_at", 100.0), \
+                patch.object(gma.time, "monotonic", return_value=100.5), \
+                patch.object(gma.time, "sleep") as sl:
+            gma._throttle_api()
+        sl.assert_called_once()
+        self.assertAlmostEqual(sl.call_args.args[0], 0.5)
+
+    def test_no_sleep_when_gap_already_elapsed(self):
+        with patch.object(gma, "API_MIN_INTERVAL_SECONDS", 1.0), \
+                patch.object(gma, "_last_api_call_at", 100.0), \
+                patch.object(gma.time, "monotonic", return_value=101.5), \
+                patch.object(gma.time, "sleep") as sl:
+            gma._throttle_api()
+        sl.assert_not_called()
+
+    def test_disabled_when_zero(self):
+        with patch.object(gma, "API_MIN_INTERVAL_SECONDS", 0), \
+                patch.object(gma.time, "sleep") as sl:
+            gma._throttle_api()
+        sl.assert_not_called()
+
+
 class TestGoalGetRetry(unittest.TestCase):
     def test_timeout_then_success(self):
         ok = FakeResponse(200, {"success": True, "data": [1]})
