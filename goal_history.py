@@ -380,6 +380,20 @@ def _norm_name(name):
     return re.sub(r"[^a-z0-9]+", "", s.casefold())
 
 
+def _dedupe_h2h(records):
+    """同一个交锋在 goal 源里可能因队名写法不同重复出现（如 M'gladbach 与
+    B. Monchengladbach），按「日期 + 比分」去重，保留排序后的第一条。"""
+    seen = set()
+    out = []
+    for r in records:
+        key = (r.get("date"), r.get("score"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def _recent_record(match, team_name):
     """team1Recent/team2Recent 不带稳定 team key，用同源规范化队名判主客。"""
     sc = _scores(match)
@@ -426,7 +440,7 @@ def parse_h2h_payload(payload, home_name=None, away_name=None):
 
     h2h = [x for x in (_direct_record(m) for m in direct) if x]
     h2h.sort(key=lambda x: x["date"], reverse=True)
-    h2h = h2h[:5]
+    h2h = _dedupe_h2h(h2h)[:5]
 
     def _recent(rows, team_name):
         out = []

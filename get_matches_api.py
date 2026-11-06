@@ -404,6 +404,40 @@ def _history_snapshot(entry):
     }
 
 
+_H2H_LINE = re.compile(r"(\d{4}-\d{2}-\d{2})\s+.*?(\d+)\s*[-:]\s*(\d+)")
+
+
+def _h2h_lines(text):
+    """h2h 文本 -> [(日期, '主比分-客比分')]；表头等非记录行忽略。"""
+    out = []
+    for line in (text or "").splitlines():
+        m = _H2H_LINE.search(line)
+        if not m:
+            continue
+        try:
+            out.append((date.fromisoformat(m.group(1)),
+                        f"{m.group(2)}-{m.group(3)}"))
+        except ValueError:
+            continue
+    return out
+
+
+def _h2h_equal(goal_text, api_text):
+    """双源 h2h 是否等价：日期允许 ±1 天（goal 转 CST、API 用 UTC），
+    比分需一致、条数需相同；队名缩写差异不参与比较。"""
+    g, a = _h2h_lines(goal_text), _h2h_lines(api_text)
+    if len(g) != len(a):
+        return False
+    unmatched = list(a)
+    for gd, gs in g:
+        hit = next((i for i, (ad, asc) in enumerate(unmatched)
+                    if asc == gs and abs((gd - ad).days) <= 1), None)
+        if hit is None:
+            return False
+        unmatched.pop(hit)
+    return True
+
+
 def build_compare_record(number, match_id, home_name, away_name, goal_entry,
                          api_entry, goal_error, api_error):
     """compare 模式单场双源快照（只写独立 shadow 文件，不进正式链路）。"""
@@ -411,8 +445,12 @@ def build_compare_record(number, match_id, home_name, away_name, goal_entry,
     a = _history_snapshot(api_entry) if api_entry else None
     diff = None
     if g and a:
-        diff = {k: g[k] == a[k] for k in
-                ("available", "home_recent_text", "away_recent_text", "h2h_text")}
+        diff = {
+            "available": g["available"] == a["available"],
+            "home_recent_text": g["home_recent_text"] == a["home_recent_text"],
+            "away_recent_text": g["away_recent_text"] == a["away_recent_text"],
+            "h2h_text": _h2h_equal(g["h2h_text"], a["h2h_text"]),
+        }
     return {
         "number": number,
         "matchId": str(match_id),

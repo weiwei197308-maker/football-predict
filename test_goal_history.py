@@ -503,6 +503,51 @@ class TestCsvContractUnchanged(unittest.TestCase):
         self.assertEqual(row["让球数"], "")
 
 
+class TestH2hDedupe(unittest.TestCase):
+    def test_same_date_score_deduped(self):
+        recs = [
+            {"date": "2025-08-25", "home": "M'gladbach", "away": "Hamburg", "score": "0-0"},
+            {"date": "2025-08-25", "home": "B. Monchengladbach", "away": "Hamburger SV", "score": "0-0"},
+            {"date": "2026-01-17", "home": "Hamburger SV", "away": "B. Monchengladbach", "score": "0-0"},
+        ]
+        out = goal_history._dedupe_h2h(recs)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["home"], "M'gladbach")
+
+    def test_different_score_kept(self):
+        recs = [{"date": "2025-08-25", "score": "1-0"},
+                {"date": "2025-08-25", "score": "0-0"}]
+        self.assertEqual(len(goal_history._dedupe_h2h(recs)), 2)
+
+    def test_empty_input(self):
+        self.assertEqual(goal_history._dedupe_h2h([]), [])
+
+
+class TestH2hEqual(unittest.TestCase):
+    def test_date_offset_one_day_counts_equal(self):
+        g = "历史交锋（近1次）：\n  2024-07-31 Coventry City 3-0 Everton"
+        a = "历史交锋（近1次）：\n  2024-07-30 Coventry 3-0 Everton"
+        self.assertTrue(gma._h2h_equal(g, a))
+
+    def test_date_offset_two_days_not_equal(self):
+        g = "历史交锋（近1次）：\n  2024-07-31 A 3-0 B"
+        a = "历史交锋（近1次）：\n  2024-07-29 A 3-0 B"
+        self.assertFalse(gma._h2h_equal(g, a))
+
+    def test_score_diff_not_equal(self):
+        g = "历史交锋（近1次）：\n  2024-07-31 A 3-0 B"
+        a = "历史交锋（近1次）：\n  2024-07-31 A 2-0 B"
+        self.assertFalse(gma._h2h_equal(g, a))
+
+    def test_length_diff_not_equal(self):
+        g = "历史交锋（近2次）：\n  2024-07-31 A 3-0 B\n  2023-01-01 A 1-1 B"
+        a = "历史交锋（近1次）：\n  2024-07-31 A 3-0 B"
+        self.assertFalse(gma._h2h_equal(g, a))
+
+    def test_both_empty_equal(self):
+        self.assertTrue(gma._h2h_equal("", ""))
+
+
 class TestApiThrottle(unittest.TestCase):
     def test_first_call_no_sleep(self):
         with patch.object(gma, "_last_api_call_at", 0.0), \
