@@ -83,6 +83,37 @@ def _hashes_match(h1, h2):
     return True, None
 
 
+def _load_previous_manifest(date_str):
+    """读取最近一次其他日期的 run_manifest，返回 (path, obj)；无可用则 (None, None)。"""
+    paths = sorted(glob.glob(os.path.join(config.RUN_LOGS_DIR, "run_manifest_*.json")))
+    paths = [p for p in paths
+             if os.path.basename(p) != f"run_manifest_{date_str}.json"]
+    if not paths:
+        return None, None
+    path = paths[-1]
+    try:
+        with open(path, encoding="utf-8") as f:
+            return path, json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+
+
+def _detect_missing_inputs(pre_hashes, prev_manifest):
+    """对比上次运行前的输入文件清单，返回“上次存在、本次缺失”的文件列表。
+
+    备份文件（.backup.）与锁文件（.lock）不计入，避免清理备份时误报。
+    """
+    if not prev_manifest:
+        return []
+    prev_hashes = (prev_manifest.get("pre_run") or {}).get("pre_run_hash") or {}
+    missing = []
+    for key in set(prev_hashes) - set(pre_hashes):
+        if ".backup." in key or key.endswith(".lock"):
+            continue
+        missing.append(key)
+    return sorted(missing)
+
+
 def _play_file_path(play, date_str):
     """当日指定玩法的影子实验文件路径。"""
     pcfg = config.PLAY_CONFIG[play]
@@ -120,6 +151,16 @@ def pre_run_checks(date_str):
     # 5. pre_run SHA256
     pre_hashes = _collect_protected_hashes()
     report["pre_run_hash"] = pre_hashes
+
+    # 5.1 与上次运行对比：检测输入文件静默消失（不阻断，仅告警）
+    prev_path, prev_manifest = _load_previous_manifest(date_str)
+    missing_inputs = _detect_missing_inputs(pre_hashes, prev_manifest)
+    report["previous_manifest"] = prev_path
+    report["missing_inputs"] = missing_inputs
+    if missing_inputs:
+        report["missing_inputs_warning"] = (
+            f"与上次运行（{os.path.basename(prev_path)}）相比缺失 {len(missing_inputs)} 个输入文件，"
+            "累计统计可能静默减少，请核对: " + "、".join(missing_inputs))
 
     # 6. 隔离确认（保护文件存在即可）
     report["isolation_ok"] = all(
@@ -190,6 +231,12 @@ def main():
         sys.exit(1)
 
     print(f"  ✅ Git HEAD={pre_report['git_HEAD'][:8]}  输入文件就绪")
+
+    if pre_report.get("missing_inputs"):
+        print(f"  ⚠️ 与上次运行相比缺失 {len(pre_report['missing_inputs'])} 个输入文件"
+              f"（累计统计可能静默减少）:")
+        for item in pre_report["missing_inputs"]:
+            print(f"     - {item}")
 
     play_results = {}
     outputs = {}
