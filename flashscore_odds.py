@@ -556,13 +556,17 @@ def build_schedule_row(norm, number):
 
 # ---------------- JSONL 存储 ----------------
 
-def write_odds_jsonl(records, target_date, data_dir="data"):
-    """写 data/odds/{date}.jsonl；同 matchId 以本次为准，其余保留（幂等合并）。"""
+def write_odds_jsonl(records, target_date, data_dir="data", prune=False):
+    """写 data/odds/{date}.jsonl；同 matchId 以本次为准，其余保留（幂等合并）。
+
+    prune=True 时只保留本次 records 的 matchId：同日重跑后，已开赛/移出白名单的
+    旧记录会被清掉，保证 JSONL 与当日赛程一一对应。
+    """
     folder = os.path.join(data_dir, "odds")
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f"{target_date}.jsonl")
     existing = {}
-    if os.path.exists(path):
+    if os.path.exists(path) and not prune:
         try:
             with open(path, "r", encoding="utf-8") as fp:
                 for line in fp:

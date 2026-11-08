@@ -510,7 +510,7 @@ def main():
     hc_path = save_json(
         os.path.join(args.output_dir, f"history_cache_{target_date}.json"),
         history_cache)
-    jsonl_path = fo.write_odds_jsonl(od_records, target_date, args.data_dir)
+    jsonl_path = fo.write_odds_jsonl(od_records, target_date, args.data_dir, prune=True)
     print(f"[6/6] CSV：{csv_path}（{len(rows)} 场）")
     print(f"      RAW：{raw_path}")
     print(f"      历史缓存：{hc_path}")

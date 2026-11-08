@@ -205,6 +205,16 @@ class TestStorage(unittest.TestCase):
             got = {r["match_id"]: r["home"] for r in rows}
             self.assertEqual(got, {"a": "A2", "b": "C"})
 
+    def test_jsonl_prune_keeps_only_current_batch(self):
+        with tempfile.TemporaryDirectory() as td:
+            rec_a = {"match_id": "a", "home": "A"}
+            rec_b = {"match_id": "b", "home": "B"}
+            fo.write_odds_jsonl([rec_a, rec_b], "2026-11-08", td)
+            fo.write_odds_jsonl([rec_b], "2026-11-08", td, prune=True)
+            with open(os.path.join(td, "odds", "2026-11-08.jsonl"), encoding="utf-8") as fp:
+                rows = [json.loads(line) for line in fp if line.strip()]
+            self.assertEqual([r["match_id"] for r in rows], ["b"])
+
     def test_save_raw_never_overwrites(self):
         with tempfile.TemporaryDirectory() as td:
             meta = {"run_id": "run1", "input": {"days": ["2026-11-08"]}}
