@@ -186,6 +186,14 @@ def phase_for_n(n_settled):
     return (4, "充分观察阶段，仍不构成统计显著性结论")
 
 
+# ========== 300 场观察节点（预注册口径） ==========
+NODE_THRESHOLD = 300
+NODE_ALPHA = 0.05
+NODE_N_PLAYS = 3
+NODE_ALPHA_CORRECTED = NODE_ALPHA / NODE_N_PLAYS
+NODE_OBSERVE_PLAYS = ("总进球", "让球", "半全场")
+
+
 # ========== 配对群体准入条件 ==========
 # P1 首选误差配对
 P1_REQUIREMENTS = {

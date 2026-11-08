@@ -262,6 +262,9 @@ def main():
             sys.exit(1)
 
         print(f"  ✅ 统计完成: N_settled={result['settled_records']}  阶段={result['phase_num']}")
+        node = result.get("node_metrics") or {}
+        if node.get("已到达"):
+            print(f"  ✅ 300 场观察节点已生成（{node['玩法']} n={node['配对数']}）")
 
         # ========== §四 数据质量检查（阻断级） ==========
         qr = result["quality_report"]
@@ -324,6 +327,9 @@ def main():
             sys.exit(1)
 
         p_qr = p_result["quality_report"]
+        p_node = p_result.get("node_metrics") or {}
+        if p_node.get("已到达"):
+            print(f"  ✅ [{play}] 300 场观察节点已生成（n={p_node['配对数']}）")
         p_failures = []
         if not p_qr.get("invariant_pass", True):
             p_failures.append(f"[{play}] 分母不变式不成立")

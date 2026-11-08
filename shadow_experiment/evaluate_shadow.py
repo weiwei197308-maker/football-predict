@@ -7,6 +7,7 @@
   - A→B 三个配对群体分母分离
   - 实验层 RunKey 独立统计，比赛层不自动选代表
 """
+import math
 import os
 import sys
 
@@ -814,6 +815,7 @@ def run_evaluate_play(play, output_dir="output"):
         "pending_records": len(records) - len(settled),
         "group_metrics": group_metrics,
         "ab_pair": ab_result,
+        "node_metrics": compute_node_metrics(records, play),
         "quality_report": loaded["quality_report"],
         "runkey_conflicts": loaded["runkey_conflicts"],
         "matchkey_conflicts": loaded["matchkey_conflicts"],
@@ -892,6 +894,137 @@ def compute_c2_comparison(records):
     }
 
 
+# ========== 300 场观察节点（预注册口径） ==========
+
+def binom_two_sided_p(k, n):
+    """双侧精确二项检验（零假设 p=0.5）。"""
+    if n <= 0:
+        return 1.0
+    p_le = sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n)
+    p_ge = sum(math.comb(n, i) for i in range(k, n + 1)) / (2 ** n)
+    return min(1.0, 2 * min(p_le, p_ge))
+
+
+def mcnemar_exact_p(b_only, a_only):
+    """配对 McNemar 精确检验：只随不一致对数变化。"""
+    return binom_two_sided_p(min(b_only, a_only), b_only + a_only)
+
+
+def paired_diff_ci(b_only, a_only, n, z=1.96):
+    """B−A 命中率差的配对 Wald 置信区间（百分点）。"""
+    if n <= 0:
+        return 0.0, 0.0, 0.0
+    diff = (b_only - a_only) / n
+    p_ab, p_ba = b_only / n, a_only / n
+    se = math.sqrt(max(p_ab + p_ba - (p_ab - p_ba) ** 2, 0.0) / n)
+    return diff * 100, (diff - z * se) * 100, (diff + z * se) * 100
+
+
+def compute_node_metrics(records, play):
+    """300 场观察节点指标；未达阈值时仍返回进度，供报告判断是否输出。"""
+    threshold = config.NODE_THRESHOLD
+    if play == config.PLAY_TTG:
+        actual_key, canon = "总进球", _canon
+    else:
+        actual_key = config.PLAY_CONFIG[play]["实际键"]
+        canon = _canon_fn_for_play(play)
+
+    both = a_only = b_only = neither = 0
+    gain = lose = same = 0
+    for rec in records:
+        actual = (rec.get("实际赛果") or {}).get(actual_key)
+        if not actual:
+            continue
+        if play == config.PLAY_TTG:
+            entries = _entries_for_runkey(rec)
+            a, b = entries["A盲判"], entries["B复核"]
+            a_ok = a["分类"] == config.CAT_VALID and a["有序"] and a["候选"]
+            b_ok = b["分类"] == config.CAT_VALID and b["有序"] and b["候选"]
+            if not (a_ok and b_ok):
+                continue
+            act = canon(actual)
+            a_pick, b_pick = canon(a["候选"][0]), canon(b["候选"][0])
+            a_cover = act in [canon(x) for x in a["候选"]]
+            b_cover = act in [canon(x) for x in b["候选"]]
+        else:
+            a = _play_entry(rec, play, "A盲判", canon)
+            b = _play_entry(rec, play, "B复核", canon)
+            a_ok = a["分类"] == config.CAT_VALID and a["有序"] and a["候选"]
+            b_ok = b["分类"] == config.CAT_VALID and b["有序"] and b["候选"]
+            if not (a_ok and b_ok):
+                continue
+            act = actual
+            a_pick, b_pick = a["候选"][0], b["候选"][0]
+            a_cover = act in a["候选"]
+            b_cover = act in b["候选"]
+
+        a_hit, b_hit = a_pick == act, b_pick == act
+        if a_hit and b_hit:
+            both += 1
+        elif a_hit:
+            a_only += 1
+        elif b_hit:
+            b_only += 1
+        else:
+            neither += 1
+        if not a_cover and b_cover:
+            gain += 1
+        elif a_cover and not b_cover:
+            lose += 1
+        else:
+            same += 1
+
+    n = both + a_only + b_only + neither
+    a_hits, b_hits = both + a_only, both + b_only
+    a_rate = round(100.0 * a_hits / n, 2) if n else 0.0
+    b_rate = round(100.0 * b_hits / n, 2) if n else 0.0
+    diff, lo, hi = paired_diff_ci(b_only, a_only, n)
+    p_val = mcnemar_exact_p(b_only, a_only)
+
+    direction = None
+    if play == config.PLAY_TTG:
+        p1 = compute_ab_pair_analysis(records)["p1_stats"]
+        n_dir = p1.get("方向理想≠0的场次", 0)
+        if n_dir:
+            direction = {
+                "场次": n_dir,
+                "正确": p1.get("方向正确移动", 0),
+                "错误": p1.get("方向错误移动", 0),
+                "p": binom_two_sided_p(p1.get("方向正确移动", 0), n_dir),
+            }
+
+    if n < threshold:
+        conclusion = f"未达阈值（{n}/{threshold}），暂不输出节点结论"
+    elif p_val < config.NODE_ALPHA_CORRECTED:
+        conclusion = (f"B 复核首选命中率显著{'高于' if b_rate > a_rate else '低于'} A"
+                      f"（p={p_val:.4f} < 校正后 α={config.NODE_ALPHA_CORRECTED:.4f}）")
+    else:
+        conclusion = (f"未达显著（p={p_val:.4f} ≥ 校正后 α={config.NODE_ALPHA_CORRECTED:.4f}），"
+                      f"不得据此调整生产逻辑")
+
+    return {
+        "玩法": play,
+        "阈值": threshold,
+        "已到达": n >= threshold,
+        "配对数": n,
+        "A命中": a_hits,
+        "B命中": b_hits,
+        "A命中率": a_rate,
+        "B命中率": b_rate,
+        "差值pp": round(diff, 2),
+        "置信区间pp": [round(lo, 2), round(hi, 2)],
+        "McNemar_p": p_val,
+        "四格": {"双方中": both, "仅A中": a_only, "仅B中": b_only, "双方不中": neither},
+        "覆盖补全": gain,
+        "覆盖丧失": lose,
+        "覆盖不变": same,
+        "覆盖p": binom_two_sided_p(min(gain, lose), gain + lose) if (gain + lose) else 1.0,
+        "方向": direction,
+        "校正后α": config.NODE_ALPHA_CORRECTED,
+        "结论": conclusion,
+    }
+
+
 # ========== 入口 ==========
 
 def run_evaluate(output_dir="output"):
@@ -935,6 +1068,7 @@ def run_evaluate(output_dir="output"):
         "ab_pair": ab_result,
         "extreme_buckets": extreme,
         "d_market_table": d_market,
+        "node_metrics": compute_node_metrics(records, config.PLAY_TTG),
         "c2_comparison": compute_c2_comparison(records),
         "quality_report": loaded["quality_report"],
         "runkey_conflicts": loaded["runkey_conflicts"],

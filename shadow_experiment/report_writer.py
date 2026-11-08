@@ -114,6 +114,41 @@ def write_shadow_summary_csv(result, date_str):
     return path
 
 
+def _node_section_lines(result):
+    """300 场观察节点段落；未达阈值时返回空列表。"""
+    node = result.get("node_metrics") or {}
+    if not node.get("已到达"):
+        return []
+    four = node.get("四格", {})
+    lines = [
+        "",
+        f"## 300 场观察节点（预注册口径，n={node['配对数']}）",
+        "",
+        f"- 首选命中：A {node['A命中率']}%（{node['A命中']}/{node['配对数']}）  "
+        f"B {node['B命中率']}%（{node['B命中']}/{node['配对数']}）  "
+        f"差 {node['差值pp']:+.2f}pp（95%CI {node['置信区间pp'][0]:+.2f} ~ {node['置信区间pp'][1]:+.2f}pp）",
+        f"- 四格：双方中={four.get('双方中', 0)}，仅A中={four.get('仅A中', 0)}，"
+        f"仅B中={four.get('仅B中', 0)}，双方不中={four.get('双方不中', 0)}",
+        f"- McNemar 精确检验 p={node['McNemar_p']:.4f}（校正后 α={node['校正后α']:.4f}）",
+        f"- 覆盖：补全={node['覆盖补全']}，丧失={node['覆盖丧失']}，不变={node['覆盖不变']}，"
+        f"覆盖配对 p={node['覆盖p']:.4f}",
+    ]
+    direction = node.get("方向")
+    if direction:
+        lines.append(f"- 方向（A 首选未覆盖实际的 {direction['场次']} 场）："
+                     f"正确 {direction['正确']}，错误 {direction['错误']}，"
+                     f"p={direction['p']:.3e}")
+    lines.append(f"- 结论：{node['结论']}")
+    lines.append("")
+    lines.append("> 节点结论仅用于影子实验评估，不构成修改生产预测逻辑的依据。")
+    lines.append("")
+    return lines
+
+
+def _append_node_section(result, lines):
+    lines.extend(_node_section_lines(result))
+
+
 def write_shadow_report_md(result, date_str):
     """O3b: 阶段分析报告 MD。"""
     lines = []
@@ -232,6 +267,8 @@ def write_shadow_report_md(result, date_str):
     lines.append(f"- D 相对市场覆盖率差 = {dm['D相对市场覆盖率差']}% = (b−c)/N")
     lines.append(f"- ⚠️ {dm['注意']}")
     lines.append("")
+
+    _append_node_section(result, lines)
 
     path = f"{config.REPORTS_DIR}/shadow_report_{date_str}.md"
     os.makedirs(config.REPORTS_DIR, exist_ok=True)
@@ -418,6 +455,8 @@ def write_play_report_md(result, date_str):
         cname = next((name for _, cid2, name in ab["classifications"] if cid2 == cid), "")
         lines.append(f"| {cid} | {cnt} | {round(100.0*cnt/cls_total, 1)}% | {cname} |")
     lines.append("")
+
+    _append_node_section(result, lines)
 
     path = f"{config.REPORTS_DIR}/shadow_report{suffix}_{date_str}.md"
     os.makedirs(config.REPORTS_DIR, exist_ok=True)
