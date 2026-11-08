@@ -383,6 +383,8 @@ def main():
     ap.add_argument("--fetch-max", type=int, default=0,
                     help="Actor 返回上限；0 = 自动（分析上限×2，至少 60）")
     ap.add_argument("--calibration-n", type=int, default=CALIBRATION_N)
+    ap.add_argument("--exclude-jc", action="store_true",
+                    help="剔除竞彩已售同场（默认不剔除；本环境只要求白名单内、日限 60）")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--output-dir", default="output")
     ap.add_argument("--main-env-output", default=MAIN_ENV_OUTPUT_DIR)
@@ -438,18 +440,26 @@ def main():
     if not records:
         sys.exit("今日白名单内无可分析比赛，结束。")
 
-    # 3) 竞彩排除（只读主环境）
+    # 3) 竞彩重合场次：默认**不剔除**（本环境只要求白名单内、日限 60，不追求与体彩一一对应）；
+    #    仍用配对结果生成双口径校验；--exclude-jc 时才真正剔除。
     jc_rows = load_jc_rows(target_date, args.main_env_output)
-    kept, excluded, ex_stats = exclude_jc(records, jc_rows)
+    overlap, ex_stats = [], {"sold": len(jc_rows), "excluded": 0, "ambiguous": 0}
     if jc_rows:
-        print(f"[3/6] 竞彩排除：主环境 {ex_stats['sold']} 场 → 剔除同联赛同开球 "
-              f"{ex_stats['excluded']} 场，歧义保留 {ex_stats['ambiguous']} 组，"
-              f"剩余 {ex_stats['kept']} 场")
+        _, overlap, ex_stats = exclude_jc(records, jc_rows)
+    if args.exclude_jc:
+        kept = [r for r in records if r not in overlap]
+        print(f"[3/6] 竞彩排除（--exclude-jc）：主环境 {ex_stats['sold']} 场 → 剔除 "
+              f"{len(overlap)} 场，歧义保留 {ex_stats['ambiguous']} 组，剩余 {len(kept)} 场")
     else:
-        print("[3/6] 竞彩排除：未找到主环境当日赛程，本次不剔除")
+        kept = list(records)
+        if jc_rows:
+            print(f"[3/6] 竞彩重合 {len(overlap)} 场（仅用于双口径校验，不剔除）；"
+                  f"主环境 {ex_stats['sold']} 场")
+        else:
+            print("[3/6] 未找到主环境当日赛程，跳过双口径校验")
 
     if not kept:
-        sys.exit("竞彩排除后无剩余场次，结束。")
+        sys.exit("无可分析场次，结束。")
 
     # 4) 优先级 + 开球时间排序，截断
     kept.sort(key=lambda r: (r["cfg"]["priority"], r["kickoff_dt"], r["match_id"]))
@@ -506,7 +516,7 @@ def main():
     print(f"      历史缓存：{hc_path}")
     print(f"      赔率 JSONL：{jsonl_path}")
 
-    calib = build_calibration(excluded, jc_rows, target_date, args.calibration_n)
+    calib = build_calibration(overlap, jc_rows, target_date, args.calibration_n)
     if calib:
         cal_path = save_json(
             os.path.join(args.output_dir, f"双口径校验_{target_date}.json"), calib)
