@@ -229,6 +229,10 @@ GOAL_LEAGUE_IDS = {
     292: "cmr77dvsf008lrx06l2d31exu",   # K League 1 / Korea Republic
 }
 
+# 候选联赛（竞彩不开售，见 leagues_config.CANDIDATE_LEAGUES）的 goal id 尚未确认：
+# 核对 goal-api 联赛检索结果后，填回 leagues_config 对应条目的 goal_league_id，
+# 再整条并入上面的 GOAL_LEAGUE_IDS（两处必须同时改，避免映射漂移）。
+
 
 def league_goal_id(api_league_id):
     """API-Football 联赛 id -> goal-api 联赛 cuid；未收录返回 None。"""

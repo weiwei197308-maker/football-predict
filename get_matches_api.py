@@ -41,6 +41,10 @@ DEFAULT_H2H_COMPARE_N = 3
 BOOKMAKER_ID = 8  # bet365
 RESULTS_RESERVE = 3
 CST = timezone(timedelta(hours=8))
+# 主环境只读目录：用于剔除「竞彩已开售」的同场比赛（只读，绝不写入）
+MAIN_ENV_OUTPUT_DIR = os.environ.get(
+    "MAIN_ENV_OUTPUT_DIR", "/Users/mac/Desktop/zucai/output")
+JC_KICKOFF_WINDOW_MINUTES = 5  # 两源开球时间以 5 分钟分桶对齐
 
 TTG_NAMES = ["0球", "1球", "2球", "3球", "4球", "5球", "6球", "7+球"]
 HAFU_VALUE_MAP = {
@@ -538,6 +542,81 @@ def save_csv(rows, target_date, output_dir):
     return path
 
 
+# ---------------- 剔除竞彩已开售场次（只读主环境产物） ----------------
+
+def _parse_kickoff(date_str, time_str):
+    """主环境 CSV 的开赛时间可能带秒（16:40:00），统一解析为 datetime。"""
+    raw = f"{(date_str or '').strip()} {(time_str or '').strip()}"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def load_jc_sold_matches(target_date, main_dir=None):
+    """读主环境当日竞彩 CSV（只读），返回 [(联赛中文名, 开球时间)]。
+
+    文件缺失时返回空列表：视为主环境尚未跑批，不做排除。
+    """
+    path = os.path.join(main_dir or MAIN_ENV_OUTPUT_DIR,
+                        f"竞彩足球_{target_date}.csv")
+    if not os.path.exists(path):
+        return []
+    sold = []
+    try:
+        with open(path, encoding="utf-8-sig") as fp:
+            for row in csv.DictReader(fp):
+                kickoff = _parse_kickoff(row.get("开赛日期"), row.get("开赛时间"))
+                league = (row.get("联赛") or "").strip()
+                if kickoff and league:
+                    sold.append((league, kickoff))
+    except OSError:
+        return []
+    return sold
+
+
+def _kickoff_bucket(kickoff):
+    minute = kickoff.minute - kickoff.minute % JC_KICKOFF_WINDOW_MINUTES
+    return kickoff.replace(minute=minute, second=0, microsecond=0)
+
+
+def exclude_jc_matches(picked, target_date, main_dir=None):
+    """按「联赛中文名 + 开球时间 5 分钟分桶」剔除竞彩已开售的同场次。
+
+    判重以数量对齐为准：主环境与本环境同桶数量相等才整组剔除；
+    数量不等（如法乙 3 场同时开球而竞彩只卖 1 场）视为歧义，保留本环境全部场次。
+    返回 (保留列表, 统计 dict)；不修改任何输入。
+    """
+    sold = load_jc_sold_matches(target_date, main_dir)
+    sold_counts = {}
+    for league, kickoff in sold:
+        key = (league, _kickoff_bucket(kickoff))
+        sold_counts[key] = sold_counts.get(key, 0) + 1
+
+    groups = {}
+    for cfg, fx in picked:
+        # 统一转 CST 后去掉 tzinfo：主环境 CSV 是 naive 本地时间，避免 aware/naive 不相等的坑
+        kickoff = datetime.fromisoformat(
+            fx["fixture"]["date"].replace("Z", "+00:00")).astimezone(CST).replace(tzinfo=None)
+        groups.setdefault((cfg["name"], _kickoff_bucket(kickoff)), []).append((cfg, fx))
+
+    kept, excluded, ambiguous = [], 0, 0
+    for key, items in groups.items():
+        n_sold = sold_counts.get(key, 0)
+        if n_sold == len(items):
+            excluded += len(items)
+            continue
+        if n_sold:
+            ambiguous += 1
+        kept.extend(items)
+
+    stats = {"sold": len(sold), "excluded": excluded,
+             "ambiguous": ambiguous, "kept": len(kept)}
+    return kept, stats
+
+
 # ---------------- 主流程 ----------------
 
 def main():
@@ -547,6 +626,8 @@ def main():
                     help="只拉赛程+1场赔率样本，打印映射结果，不写文件")
     ap.add_argument("--no-history", action="store_true", help="跳过历史数据预取")
     ap.add_argument("--output-dir", default="output")
+    ap.add_argument("--main-env-output", default=MAIN_ENV_OUTPUT_DIR,
+                    help="主环境 output 目录（只读，用于剔除竞彩已开售场次）")
     args = ap.parse_args()
 
     source = resolve_h2h_source()
@@ -598,8 +679,15 @@ def main():
         print(f"\ndry-run 共用 {_req_count} 次请求（未写任何文件）。")
         return
 
+    picked, excl_stats = exclude_jc_matches(picked, args.date, args.main_env_output)
+    if excl_stats["sold"]:
+        print(f"竞彩排除：主环境当日 {excl_stats['sold']} 场 → 剔除同联赛同开球 "
+              f"{excl_stats['excluded']} 场，保留 {excl_stats['kept']} 场"
+              f"（数量不等歧义组 {excl_stats['ambiguous']}）")
+    else:
+        print("竞彩排除：未找到主环境当日赛程，本次不剔除（先让主环境跑批更准确）")
     if not picked:
-        print("今天白名单内没有未开赛比赛。")
+        print("今日无竞彩以外未开赛比赛，结束（不再消耗赔率请求）。")
         return
 
     budget = remaining - RESULTS_RESERVE - _req_count

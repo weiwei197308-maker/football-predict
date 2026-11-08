@@ -6,7 +6,7 @@
 
 输入（--output-dir 默认 output）：
   竞彩分析_{date}.csv（M1，可缺）、独立分析_{date}.csv（M2，可缺）、
-  赛果_{date}.json（必需，由 get_results_api.py 生成）、
+  赛果_{date}.json（必需，由 get_results_flashscore.py 生成）、
   竞彩足球_{date}.csv（必需，取 编号→matchId 映射、让球数与对阵）
 输出：
   控制台汇总 + 同场配对对照 + {output-dir}/对照报告_{date}.md
@@ -29,6 +29,7 @@ from lottery_rules import (
     parse_score as rules_parse_score, parse_total_goals_list,
     extract_handicap_direction, total_goals_label,
 )
+import store_samples
 
 PLAYS = (("spf", "胜平负"), ("rq", "让球胜平负"), ("ttg", "总进球"),
          ("hafu", "半全场"), ("crs", "比分"))
@@ -137,7 +138,7 @@ def settle_row(row, act):
 # ---------------- 数据加载 ----------------
 
 def load_schedule(path):
-    """赛程 CSV → {编号: {matchId, 让球数, home, away}}。"""
+    """赛程 CSV → {编号: {matchId, 联赛, 让球数, home, away, kickoff}}。"""
     with open(path, "r", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     sched = {}
@@ -146,10 +147,45 @@ def load_schedule(path):
         if num:
             sched[num] = {
                 "matchId": str(r.get("matchId", "") or "").strip(),
+                "联赛": str(r.get("联赛", "") or "").strip(),
                 "让球数": str(r.get("让球数", "") or "").strip(),
                 "home": r.get("主队", ""), "away": r.get("客队", ""),
+                "kickoff": (f"{r.get('开赛日期', '')} {r.get('开赛时间', '')}").strip(),
             }
     return sched
+
+
+def find_result(results, sc):
+    """赛果查找：优先「联赛|主队|客队」（Apify 口径），兼容旧 matchId 键。"""
+    if not sc:
+        return None
+    key = f"{sc.get('联赛', '')}|{sc.get('home', '')}|{sc.get('away', '')}"
+    return results.get(key) or results.get(sc.get("matchId", ""))
+
+
+def load_raw_meta(path):
+    """读取赛程 _raw.json，返回 {matchId: {odds_source, history_source}}。"""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    items = payload.get("items") if isinstance(payload, dict) else payload
+    out = {}
+    for item in (items or []):
+        if not isinstance(item, dict):
+            continue
+        mid = str(((item.get("fixture") or {}).get("fixture") or {}).get("id") or "")
+        if not mid:
+            continue
+        flags = item.get("odds_flags") or {}
+        out[mid] = {
+            "odds_source": str(flags.get("odds_source") or ""),
+            "history_source": str(item.get("history_source") or ""),
+        }
+    return out
 
 
 def load_arm(path):
@@ -165,6 +201,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=date.today().strftime("%Y-%m-%d"))
     ap.add_argument("--output-dir", default="output")
+    ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--batch", default="B", help="样本批次：B=Apify（默认），A=API-Football 存档")
+    ap.add_argument("--no-samples", action="store_true", help="只结算，不追加 data/samples.csv")
     args = ap.parse_args()
     od, d = args.output_dir, args.date
 
@@ -201,7 +240,7 @@ def main():
         for row in rows:
             num = str(row.get("编号", "") or "").strip()
             sc = sched.get(num)
-            res = results.get(sc["matchId"]) if sc else None
+            res = find_result(results, sc)
             if not res:
                 skipped += 1
                 continue
@@ -301,6 +340,51 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"\n💾 报告已保存：{out_path}")
+
+    # ---------------- 追加长期样本（JSONL 由赛程入口写，这里写汇总 CSV） ----------------
+    if args.no_samples:
+        print("⏭  已指定 --no-samples，不追加 data/samples.csv")
+        return
+    raw_meta = load_raw_meta(os.path.join(od, f"竞彩足球_{d}_raw.json"))
+    sample_rows = []
+    for num in all_nums:
+        first_arm = next(a for a in settled if num in settled[a])
+        info = settled[first_arm][num]
+        sc, res = info["sched"], info["res"]
+        meta = raw_meta.get(sc.get("matchId", ""), {})
+        row = {
+            "date": d, "batch": args.batch, "match_id": sc.get("matchId", ""),
+            "league": sc.get("联赛", ""), "home": sc.get("home", ""),
+            "away": sc.get("away", ""), "kickoff": sc.get("kickoff", ""),
+            "rq_line": sc.get("让球数", ""),
+            "history_source": meta.get("history_source", ""),
+            "odds_source": meta.get("odds_source", "apify:flashscore"),
+            "ft_home": res.get("ft_home", ""), "ft_away": res.get("ft_away", ""),
+            "ht_home": "" if res.get("ht_home") is None else res.get("ht_home"),
+            "ht_away": "" if res.get("ht_away") is None else res.get("ht_away"),
+        }
+        for arm in ("M1", "M2"):
+            alias = arm.lower()
+            entry = settled.get(arm, {}).get(num)
+            for play, _ in PLAYS:
+                if not entry:
+                    row[f"{alias}_{play}"] = ""
+                    row[f"{alias}_{play}_first"] = ""
+                    row[f"{alias}_{play}_any"] = ""
+                    continue
+                row[f"{alias}_{play}"] = entry["raws"][play]
+                first, any_hit = entry["hits"][play]
+                row[f"{alias}_{play}_first"] = "" if first is None else int(first)
+                row[f"{alias}_{play}_any"] = "" if any_hit is None else int(any_hit)
+        sample_rows.append(row)
+
+    path, added = store_samples.append_samples(d, args.batch, sample_rows, args.data_dir)
+    store_samples.append_batch(
+        d, args.batch, len(sample_rows),
+        note=f"每日上限 60；结算 {len(sample_rows)} 场（源：Apify Flashscore）",
+        data_dir=args.data_dir)
+    total = store_samples.count_samples(args.data_dir)
+    print(f"📚 样本已追加：{path}（本次新增 {added} 行，累计 {total} 行）")
 
 
 if __name__ == "__main__":

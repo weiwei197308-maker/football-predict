@@ -35,6 +35,9 @@ secrets.*
 # ---- 运行产物：每日报告 / 预测快照 / 复盘 / 深度归因 / 运行日志 ----
 output/
 
+# ---- 运行期数据：赔率 JSONL / 原始归档 / 样本总表 / 球队名单缓存（2026-11-08）----
+/data/
+
 # ---- 影子实验统计报告：由 run_manifest.py 生成，属运行产物 ----
 shadow_experiment/reports/
 shadow_experiment/run_logs/
