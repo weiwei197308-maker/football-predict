@@ -481,6 +481,8 @@ def main():
                    "number": number,
                    "league": rec["cfg"]["name"],
                    "source_batch": "B",
+                   "history_source": rec.get("history_source", "none"),
+                   "history_error": rec.get("history_error"),
                    "run_id": meta.get("run_id", "")}
                   for rec, number in numbered]
 
