@@ -179,11 +179,19 @@ def _is_bet365(market):
     return _bookmaker_name(market).lower() == "bet365"
 
 
-def _pick_market(markets, bet_type, usable):
-    """优先 bet365，其次选择项最多的书商（逐盘口独立选择）。"""
+def _pick_market(markets, bet_type, usable, coverage=None):
+    """选择盘口书商。
+
+    默认优先 bet365，其次选择项最多的书商（逐盘口独立选择）。
+    coverage 非空时改为「覆盖档位最多优先、同档 bet365 优先」：比分盘各书商
+    档位差异大，bet365 常缺 0:5/5:0 等高比分，需让完整书商胜出。
+    """
     cands = [m for m in markets if m.get("bet_type") == bet_type and usable(m)]
     if not cands:
         return None
+    if coverage:
+        cands.sort(key=lambda m: (coverage(m), _is_bet365(m)), reverse=True)
+        return cands[0]
     for m in cands:
         if _is_bet365(m):
             return m
@@ -462,7 +470,8 @@ def normalize_item(item, league_cfg=None):
     ttg_market = _pick_market(markets, "OVER_UNDER", lambda m: len(_ou_lines(m)) >= 4)
     rq_market = _pick_market(markets, "ASIAN_HANDICAP", lambda m: len(_integer_pairs(m)) >= 1)
     hafu_market = _pick_market(markets, "HALF_FULL_TIME", lambda m: len(map_hafu(m)) >= 6)
-    crs_market = _pick_market(markets, "CORRECT_SCORE", lambda m: len(map_crs(m)) >= 8)
+    crs_market = _pick_market(markets, "CORRECT_SCORE", lambda m: len(map_crs(m)) >= 8,
+                              coverage=lambda m: len(map_crs(m)))
 
     spf = map_spf(spf_market) if spf_market else {}
     if not spf:

@@ -104,6 +104,18 @@ class TestNormalizeItem(unittest.TestCase):
             fo.normalize_item(item(odds=[ah_market()]))
 
 
+class TestBookmakerSelection(unittest.TestCase):
+    def test_crs_prefers_full_coverage_over_bet365(self):
+        sparse = crs_market()  # bet365，8 档
+        full = market("CORRECT_SCORE", sparse["selections"] + [
+            sel("5:0", 30.0, score="5:0")], bookmaker="BetMGM.uk")
+        norm = fo.normalize_item(item(odds=[spf_market(), sparse, full]))
+        self.assertEqual(norm["odds_flags"]["crs_bookmaker"], "BetMGM.uk")
+        self.assertIn("5:0", norm["odds_mapped"]["crs"])
+        # 其他玩法仍优先 bet365
+        self.assertEqual(norm["odds_flags"]["spf_bookmaker"], "bet365")
+
+
 class TestTotalGoals(unittest.TestCase):
     def test_ladder_bounds_and_normalization(self):
         odds, flags = fo.derive_total_goals(ou_market())
