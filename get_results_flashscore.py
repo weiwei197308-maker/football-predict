@@ -19,7 +19,7 @@ import csv
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import flashscore_odds as fo
 
@@ -84,9 +84,15 @@ def main():
     if not comps:
         sys.exit("错误：无法从赛程产物中解析 competition.display_name")
 
-    max_results = args.max_results or max(len(sched) * 3, 60)
-    print(f"[1/3] 拉取 Flashscore 完赛结果：{d}，{len(comps)} 个联赛，上限 {max_results}")
-    items, meta = fo.fetch_items(comps, days=[d], status="finished",
+    # Actor 的 days 以 UTC 日切分，且实测只从首个日期开始加载：
+    # 只传 [d] 会漏掉 d 当天较早完赛的场次（例如英超 14:00Z）。
+    # 向前多看一天，再用 matchId/队名精确匹配，多余场次不会进入结果。
+    prev = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    days = [prev, d]
+    max_results = args.max_results or max(len(sched) * 5, 160)
+    print(f"[1/3] 拉取 Flashscore 完赛结果：{d}，{len(comps)} 个联赛，"
+          f"日期 {days}，上限 {max_results}")
+    items, meta = fo.fetch_items(comps, days=days, status="finished",
                                  max_results=max_results)
     raw_path = fo.save_raw(items, meta, d, args.data_dir, prefix="apify_results")
     print(f"  Actor 返回 {len(items)} 场；原始响应：{raw_path}")

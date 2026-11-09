@@ -24,7 +24,7 @@ import json
 import os
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 
 import flashscore_odds as fo
@@ -381,7 +381,7 @@ def main():
     ap.add_argument("--date", default=date.today().strftime("%Y-%m-%d"))
     ap.add_argument("--max-matches", type=int, default=DEFAULT_MAX_MATCHES)
     ap.add_argument("--fetch-max", type=int, default=0,
-                    help="Actor 返回上限；0 = 自动（分析上限×2，至少 60）")
+                    help="Actor 返回上限；0 = 自动（分析上限×3，至少 90）")
     ap.add_argument("--calibration-n", type=int, default=CALIBRATION_N)
     ap.add_argument("--exclude-jc", action="store_true",
                     help="剔除竞彩已售同场（默认不剔除；本环境只要求白名单内、日限 60）")
@@ -399,30 +399,42 @@ def main():
 
     print(f"[1/6] 拉取 Apify Flashscore：{target_date}，"
           f"白名单 {len(FLASHSCORE_COMPETITIONS)} 个联赛")
+    next_date = (datetime.strptime(target_date, "%Y-%m-%d")
+                 + timedelta(days=1)).strftime("%Y-%m-%d")
+    # Actor 按 UTC 日切分：CST 当日 12:00 ~ 次日 12:00 的赛程会横跨两个 UTC 日，
+    # 因此同时请求 target_date 与次日，再按下面的 24h 窗口精确过滤。
     items, meta = fo.fetch_items(
-        FLASHSCORE_COMPETITIONS, days=[target_date], status="scheduled",
-        max_results=args.fetch_max or max(args.max_matches * 2, 60))
+        FLASHSCORE_COMPETITIONS, days=[target_date, next_date], status="scheduled",
+        max_results=args.fetch_max or max(args.max_matches * 3, 90))
     print(f"  Actor 返回 {len(items)} 场（run_id={meta.get('run_id') or '-'}）")
 
     if not args.dry_run:
         raw_path = fo.save_raw(items, meta, target_date, args.data_dir)
         print(f"  原始响应已归档：{raw_path}")
 
-    # 2) 白名单 + CST 当日过滤 + 标准化
+    # 2) 白名单 + 24h 窗口过滤 + 标准化
+    anchor = datetime.strptime(target_date, "%Y-%m-%d").replace(
+        hour=12, minute=0, second=0, tzinfo=fo.CST)
+    now_cst = datetime.now(fo.CST)
+    lower = max(anchor, now_cst) if now_cst.strftime("%Y-%m-%d") == target_date else anchor
+    lower_naive = lower.replace(tzinfo=None)
+    window_end = (anchor + timedelta(hours=24)).replace(tzinfo=None)
     records, unknown_names, bad_items = [], defaultdict(int), 0
+    known = 0
     for item in items:
         display = str((item.get("competition") or {}).get("display_name") or "")
         cfg = resolve_league_cfg(display)
         if not cfg:
             unknown_names[display] += 1
             continue
+        known += 1
         try:
             norm = fo.normalize_item(item, cfg)
         except ValueError:
             bad_items += 1
             continue
         kickoff_dt = fo._cst_dt(norm["kickoff_utc"]).replace(tzinfo=None)
-        if kickoff_dt.strftime("%Y-%m-%d") != target_date:
+        if not (lower_naive <= kickoff_dt < window_end):
             continue
         records.append({
             "cfg": cfg, "norm": norm, "match_id": norm["match_id"],
@@ -430,7 +442,9 @@ def main():
             "league_display": norm["league_display"],
             "kickoff_utc": norm["kickoff_utc"], "kickoff_dt": kickoff_dt,
         })
-    print(f"[2/6] 白名单命中 {len(records)} 场；无胜平负赔率跳过 {bad_items} 场")
+    print(f"[2/6] 白名单命中 {known} 场；CST 窗口 "
+          f"{lower_naive:%m-%d %H:%M} ~ {window_end:%m-%d %H:%M} 内 {len(records)} 场；"
+          f"无胜平负赔率跳过 {bad_items} 场")
     if unknown_names:
         top = sorted(unknown_names.items(), key=lambda x: -x[1])[:6]
         print("  未收录的 competition.display_name（如需纳入请补 leagues_config）：")
