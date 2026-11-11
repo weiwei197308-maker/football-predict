@@ -71,6 +71,9 @@ def main():
     ap.add_argument("--output-dir", default="output")
     ap.add_argument("--max-results", type=int, default=0,
                     help="Actor 返回上限；0 = 自动（场次×3，至少 60）")
+    ap.add_argument("--comps", default="",
+                    help="逗号分隔的 Flashscore competition.display_name；"
+                         "不传则从 _raw.json / jsonl 自动推断")
     args = ap.parse_args()
     d = args.date
 
@@ -78,17 +81,23 @@ def main():
     if not os.path.exists(sched_path):
         sys.exit(f"错误：找不到 {sched_path}（赛果回填需要当日赛程）")
     sched = load_schedule(sched_path)
-    comps = competitions_from_raw(
-        os.path.join(args.output_dir, f"竞彩足球_{d}_raw.json"),
-        os.path.join(args.data_dir, "odds", f"{d}.jsonl"))
+    if args.comps.strip():
+        comps = [c.strip() for c in args.comps.split(",") if c.strip()]
+    else:
+        comps = competitions_from_raw(
+            os.path.join(args.output_dir, f"竞彩足球_{d}_raw.json"),
+            os.path.join(args.data_dir, "odds", f"{d}.jsonl"))
     if not comps:
-        sys.exit("错误：无法从赛程产物中解析 competition.display_name")
+        sys.exit("错误：无法解析 competition.display_name（可传 --comps 手动指定）")
 
-    # Actor 的 days 以 UTC 日切分，且实测只从首个日期开始加载：
-    # 只传 [d] 会漏掉 d 当天较早完赛的场次（例如英超 14:00Z）。
-    # 向前多看一天，再用 matchId/队名精确匹配，多余场次不会进入结果。
+    # Actor 的 days 以 UTC 日切分，且比赛的 UTC 归属日可能跨赛程的 CST 销售日：
+    #   - 早开球（CST 上午/下午）→ UTC 同 d 的凌晨 → 用 prev,d
+    #   - 晚开球（CST 凌晨）→ UTC 前一日傍晚 → 用 prev,d
+    #   - 刚完赛的场次可能在 Actor 索引里滞后一天 → 补 next
+    # 用三天 [prev, d, next] 覆盖所有可能的 UTC 归属；多余场次会在匹配阶段被过滤。
     prev = (datetime.strptime(d, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    days = [prev, d]
+    next_day = (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    days = [prev, d, next_day]
     max_results = args.max_results or max(len(sched) * 5, 160)
     print(f"[1/3] 拉取 Flashscore 完赛结果：{d}，{len(comps)} 个联赛，"
           f"日期 {days}，上限 {max_results}")
