@@ -376,6 +376,19 @@ def save_json(path, payload):
 
 # ---------------- 主流程 ----------------
 
+def resolve_window(target_date, now_cst, hours=24):
+    """返回 (lower, upper, mode) 窗口。
+
+    目标日为今天：滚动窗口 [now, now+24h)——工作日用日历锚点会只剩次日凌晨几场。
+    目标日非今天（补跑/预跑历史日期）：沿用日历销售日窗口 [当日 12:00, 次日 12:00)。
+    """
+    anchor = datetime.strptime(target_date, "%Y-%m-%d").replace(
+        hour=12, minute=0, second=0, tzinfo=now_cst.tzinfo)
+    if now_cst.strftime("%Y-%m-%d") == target_date:
+        return now_cst, now_cst + timedelta(hours=hours), "rolling"
+    return anchor, anchor + timedelta(hours=hours), "calendar"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=date.today().strftime("%Y-%m-%d"))
@@ -413,12 +426,10 @@ def main():
         print(f"  原始响应已归档：{raw_path}")
 
     # 2) 白名单 + 24h 窗口过滤 + 标准化
-    anchor = datetime.strptime(target_date, "%Y-%m-%d").replace(
-        hour=12, minute=0, second=0, tzinfo=fo.CST)
     now_cst = datetime.now(fo.CST)
-    lower = max(anchor, now_cst) if now_cst.strftime("%Y-%m-%d") == target_date else anchor
+    lower, window_end, window_mode = resolve_window(target_date, now_cst)
     lower_naive = lower.replace(tzinfo=None)
-    window_end = (anchor + timedelta(hours=24)).replace(tzinfo=None)
+    window_end = window_end.replace(tzinfo=None)
     records, unknown_names, bad_items = [], defaultdict(int), 0
     known = 0
     for item in items:
@@ -442,7 +453,7 @@ def main():
             "league_display": norm["league_display"],
             "kickoff_utc": norm["kickoff_utc"], "kickoff_dt": kickoff_dt,
         })
-    print(f"[2/6] 白名单命中 {known} 场；CST 窗口 "
+    print(f"[2/6] 白名单命中 {known} 场；CST 窗口（{window_mode}）"
           f"{lower_naive:%m-%d %H:%M} ~ {window_end:%m-%d %H:%M} 内 {len(records)} 场；"
           f"无胜平负赔率跳过 {bad_items} 场")
     if unknown_names:
