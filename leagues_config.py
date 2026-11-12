@@ -141,5 +141,20 @@ FLASHSCORE_ALIASES = {
 for _alias, _api_id in FLASHSCORE_ALIASES.items():
     if _api_id in _BY_API_ID_ALL:
         BY_FLASHSCORE[_alias] = {**_BY_API_ID_ALL[_api_id], "flashscore": _alias}
-FLASHSCORE_COMPETITIONS = list(FLASHSCORE_NAMES.values())
+# 国际比赛日：欧国联 A–D 组（Flashscore 按组拆成四个 display_name，体彩有售）。
+# 纳入理由（2026-11-12 用户确认）：A 思路按赛事类型检索资料，国家联赛场次少，
+# 混入不会造成系统性偏移；league 记「欧国联A/B/C/D」，便于事后单独剔除。
+NATIONS_LEAGUE_DISPLAYS = {
+    "EUROPE: UEFA Nations League - League A": "欧国联A",
+    "EUROPE: UEFA Nations League - League B": "欧国联B",
+    "EUROPE: UEFA Nations League - League C": "欧国联C",
+    "EUROPE: UEFA Nations League - League D": "欧国联D",
+}
+for _display, _name in NATIONS_LEAGUE_DISPLAYS.items():
+    BY_FLASHSCORE[_display] = {
+        "api_id": None, "name": _name,
+        "full_name": f"欧洲国家联赛 {_name[-1]} 级",
+        "prefix": "UNL", "priority": 5, "flashscore": _display,
+    }
+FLASHSCORE_COMPETITIONS = list(FLASHSCORE_NAMES.values()) + list(NATIONS_LEAGUE_DISPLAYS)
 
