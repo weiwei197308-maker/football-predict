@@ -22,11 +22,31 @@ import sys
 from datetime import date, datetime, timedelta
 
 import flashscore_odds as fo
+from leagues_config import BY_FLASHSCORE
 
 
 def load_schedule(path):
     with open(path, "r", encoding="utf-8-sig") as fp:
         return list(csv.DictReader(fp))
+
+
+def pending_leagues(samples_path, d):
+    """该日样本的结算情况，返回 (是否已有样本, 未结算联赛短名集合)。
+
+    已全部结算时集合为空 —— 说明这场日期的回填已完成，无需再请求 Actor。
+    """
+    if not os.path.exists(samples_path):
+        return False, set()
+    rows = []
+    with open(samples_path, "r", encoding="utf-8-sig") as fp:
+        for rec in csv.DictReader(fp):
+            if rec.get("date") == d:
+                rows.append(rec)
+    if not rows:
+        return False, set()
+    pending = {str(r.get("league") or "").strip() for r in rows
+               if not str(r.get("ft_home") or "").strip()}
+    return True, pending
 
 
 def competitions_from_raw(raw_path, jsonl_path):
@@ -89,6 +109,25 @@ def main():
             os.path.join(args.data_dir, "odds", f"{d}.jsonl"))
     if not comps:
         sys.exit("错误：无法解析 competition.display_name（可传 --comps 手动指定）")
+
+    # 已全部结算 → 不再请求（重复跑同一天时省掉整轮赛果额度）
+    has_rows, pending = pending_leagues(
+        os.path.join(args.data_dir, "samples.csv"), d)
+    if has_rows and not pending:
+        print(f"[跳过] {d} 的样本已全部结算，不再请求 Actor")
+        return 0
+    if has_rows:
+        keep = [c for c in comps
+                if str(BY_FLASHSCORE.get(c, {}).get("name") or "").strip() in pending]
+        if keep and len(keep) < len(comps):
+            print(f"  仅回填未结算联赛：{len(keep)}/{len(comps)} 个")
+            comps = keep
+
+    used = fo.monthly_usage(args.data_dir)
+    print(f"  {fo.quota_message(used)}")
+    if used >= fo.MONTHLY_QUOTA - fo.QUOTA_RESERVE:
+        print(f"[跳过] 剩余额度不足 {fo.QUOTA_RESERVE} 场预留，本轮不回填赛果")
+        return 0
 
     # Actor 的 days 以 UTC 日切分，且比赛的 UTC 归属日可能跨赛程的 CST 销售日：
     #   - 早开球（CST 上午/下午）→ UTC 同 d 的凌晨 → 用 prev,d

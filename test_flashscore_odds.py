@@ -253,6 +253,69 @@ class TestResultsHelpers(unittest.TestCase):
             comps = gr.competitions_from_raw(raw, os.path.join(td, "no.jsonl"))
             self.assertEqual(comps, ["ENGLAND: Championship", "SPAIN: LaLiga"])
 
+    def test_pending_leagues_all_settled(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "samples.csv")
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write("date,league,ft_home\n2026-11-11,巴乙,2\n2026-11-11,英甲,1\n")
+            has_rows, pending = gr.pending_leagues(path, "2026-11-11")
+            self.assertTrue(has_rows)
+            self.assertEqual(pending, set())
+
+    def test_pending_leagues_returns_unsettled(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "samples.csv")
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write("date,league,ft_home\n2026-11-11,巴乙,2\n"
+                         "2026-11-11,英甲,\n2026-11-12,意丙,\n")
+            has_rows, pending = gr.pending_leagues(path, "2026-11-11")
+            self.assertTrue(has_rows)
+            self.assertEqual(pending, {"英甲"})
+
+    def test_pending_leagues_without_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "samples.csv")
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write("date,league,ft_home\n2026-11-11,巴乙,2\n")
+            self.assertEqual(gr.pending_leagues(path, "2026-11-10"), (False, set()))
+            self.assertEqual(gr.pending_leagues(os.path.join(td, "none.csv"),
+                                                "2026-11-11"), (False, set()))
+
+
+class TestMonthlyQuota(unittest.TestCase):
+    """月度额度账本：按 data/raw/{YYYY-MM} 下原始归档的返回条数累计。"""
+
+    def test_sums_items_in_month_folder(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = os.path.join(td, "raw", "2026-11")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "apify_run1.json"), "w",
+                      encoding="utf-8") as fp:
+                json.dump({"items": [{"a": 1}, {"a": 2}]}, fp)
+            with open(os.path.join(folder, "apify_results_run2.json"), "w",
+                      encoding="utf-8") as fp:
+                json.dump({"items": [{"a": 3}]}, fp)
+            with open(os.path.join(folder, "notes.json"), "w",
+                      encoding="utf-8") as fp:
+                json.dump({"items": [{"a": 4}]}, fp)
+            self.assertEqual(fo.monthly_usage(td, "2026-11"), 3)
+
+    def test_missing_month_folder_is_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(fo.monthly_usage(td, "2026-12"), 0)
+
+    def test_broken_file_counts_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = os.path.join(td, "raw", "2026-11")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "apify_bad.json"), "w",
+                      encoding="utf-8") as fp:
+                fp.write("{not json")
+            self.assertEqual(fo.monthly_usage(td, "2026-11"), 0)
+
+    def test_reserve_below_quota(self):
+        self.assertLess(fo.MONTHLY_QUOTA - fo.QUOTA_RESERVE, fo.MONTHLY_QUOTA)
+
 
 if __name__ == "__main__":
     unittest.main()

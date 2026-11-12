@@ -389,6 +389,20 @@ def resolve_window(target_date, now_cst, hours=24):
     return anchor, anchor + timedelta(hours=hours), "calendar"
 
 
+def resolve_days(target_date, now_cst):
+    """返回 Actor 的 days 参数。
+
+    Actor 的 days 按联赛当地日期归档：当地 D 的比赛 ≈ CST D 下午至 D+1 上午，
+    已覆盖滚动窗口，故默认只请求目标日；16:00 后运行时窗口末端会进入次日当地
+    的下午场，此时追加次日，避免为窗口外的场次付费。
+    """
+    days = [target_date]
+    if now_cst.strftime("%Y-%m-%d") == target_date and now_cst.hour >= 16:
+        days.append((datetime.strptime(target_date, "%Y-%m-%d")
+                     + timedelta(days=1)).strftime("%Y-%m-%d"))
+    return days
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=date.today().strftime("%Y-%m-%d"))
@@ -412,14 +426,16 @@ def main():
 
     print(f"[1/6] 拉取 Apify Flashscore：{target_date}，"
           f"白名单 {len(FLASHSCORE_COMPETITIONS)} 个联赛")
-    next_date = (datetime.strptime(target_date, "%Y-%m-%d")
-                 + timedelta(days=1)).strftime("%Y-%m-%d")
-    # Actor 按 UTC 日切分：CST 当日 12:00 ~ 次日 12:00 的赛程会横跨两个 UTC 日，
-    # 因此同时请求 target_date 与次日，再按下面的 24h 窗口精确过滤。
+    run_now = datetime.now(fo.CST)
+    days = resolve_days(target_date, run_now)
+    used = fo.monthly_usage(args.data_dir)
+    print(f"  {fo.quota_message(used)}")
+    if used >= fo.MONTHLY_QUOTA:
+        sys.exit(f"错误：{fo.quota_message(used)} 已达免费额度，本轮不发起请求")
     items, meta = fo.fetch_items(
-        FLASHSCORE_COMPETITIONS, days=[target_date, next_date], status="scheduled",
+        FLASHSCORE_COMPETITIONS, days=days, status="scheduled",
         max_results=args.fetch_max or max(args.max_matches * 3, 90))
-    print(f"  Actor 返回 {len(items)} 场（run_id={meta.get('run_id') or '-'}）")
+    print(f"  Actor 返回 {len(items)} 场（days={days}，run_id={meta.get('run_id') or '-'}）")
 
     if not args.dry_run:
         raw_path = fo.save_raw(items, meta, target_date, args.data_dir)

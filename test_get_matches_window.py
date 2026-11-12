@@ -9,7 +9,7 @@ if not hasattr(football_history, "summarize_h2h"):
     sys.modules.pop("football_history", None)
     football_history = importlib.import_module("football_history")
 
-from get_matches_flashscore import resolve_window
+from get_matches_flashscore import resolve_days, resolve_window
 
 CST = timezone(timedelta(hours=8))
 
@@ -41,6 +41,22 @@ class TestResolveWindow(unittest.TestCase):
         lower, upper, mode = resolve_window("2026-11-15", now)
         self.assertEqual(mode, "calendar")
         self.assertEqual(lower, datetime(2026, 11, 15, 12, 0, tzinfo=CST))
+
+
+class TestResolveDays(unittest.TestCase):
+    """Actor days 参数：默认只请求目标日，傍晚运行才追加次日（省额度）。"""
+
+    def test_morning_run_only_target_day(self):
+        now = datetime(2026, 11, 12, 8, 33, tzinfo=CST)
+        self.assertEqual(resolve_days("2026-11-12", now), ["2026-11-12"])
+
+    def test_evening_run_adds_next_day(self):
+        now = datetime(2026, 11, 12, 16, 5, tzinfo=CST)
+        self.assertEqual(resolve_days("2026-11-12", now), ["2026-11-12", "2026-11-13"])
+
+    def test_backfill_never_adds_next_day(self):
+        now = datetime(2026, 11, 12, 20, 0, tzinfo=CST)
+        self.assertEqual(resolve_days("2026-11-08", now), ["2026-11-08"])
 
 
 if __name__ == "__main__":

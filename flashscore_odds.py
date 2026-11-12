@@ -157,6 +157,48 @@ def save_raw(items, meta, target_date, data_dir="data", prefix="apify"):
     return path
 
 
+# ---------------- 月度额度（Apify 免费档 2500 场/月） ----------------
+MONTHLY_QUOTA = 2500   # 每月免费返回场次上限
+QUOTA_RESERVE = 200    # 剩余不足该值时不再发起赛果类请求
+
+
+def _raw_count(path):
+    """单个原始归档文件的返回条数。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+    except (OSError, ValueError):
+        return 0
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        return len(items) if isinstance(items, list) else 0
+    return len(payload) if isinstance(payload, list) else 0
+
+
+def monthly_usage(data_dir="data", month=None):
+    """当月已消耗场次 = data/raw/{YYYY-MM-DD}/apify_*.json 的返回条数之和。
+
+    Actor 按返回场次计费，原始归档是本机唯一可靠的账本；按月前缀天然归零。
+    """
+    month = month or datetime.now(CST).strftime("%Y-%m")
+    root = os.path.join(data_dir, "raw")
+    if not os.path.isdir(root):
+        return 0
+    total = 0
+    for entry in sorted(os.listdir(root)):
+        folder = os.path.join(root, entry)
+        if not entry.startswith(month) or not os.path.isdir(folder):
+            continue
+        total += sum(_raw_count(os.path.join(folder, name))
+                     for name in sorted(os.listdir(folder))
+                     if name.startswith("apify_") and name.endswith(".json"))
+    return total
+
+
+def quota_message(used, quota=MONTHLY_QUOTA):
+    return f"当月 Apify 额度已用 {used}/{quota} 场"
+
+
 # ---------------- 基础解析 ----------------
 
 def _num(value):
