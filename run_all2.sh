@@ -22,6 +22,16 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 DATE=$(date +%Y-%m-%d)
 YESTERDAY=$(date -v-1d +%Y-%m-%d 2>/dev/null || date -d yesterday +%Y-%m-%d)
 
+# 昨日赛程行数（扣除表头）：0 表示当天无比赛，赛果回填与结算都没有输入可跑
+YESTERDAY_CSV="output/竞彩足球_${YESTERDAY}.csv"
+YESTERDAY_ROWS=0
+if [ -f "$YESTERDAY_CSV" ]; then
+    YESTERDAY_ROWS=$(( $(wc -l < "$YESTERDAY_CSV") - 1 ))
+    if [ "$YESTERDAY_ROWS" -lt 0 ]; then
+        YESTERDAY_ROWS=0
+    fi
+fi
+
 for V in APIFY_TOKEN GOAL_API_KEY DEEPSEEK_API_KEY; do
     if [ -z "${!V}" ]; then
         echo "❌ 错误：环境变量 $V 未设置（请写入 ~/.zshrc 后 source）"
@@ -56,10 +66,16 @@ run_step "[2/5] M1 带赔率分析（analyze.py 原样，wrapper 注入历史缓
     $PYTHON run_analyze_m1.py
 run_step "[3/5] M2 无赔率独立分析（可能要等几分钟）..." \
     $PYTHON analyze_independent.py
-run_step "[4/5] 回填昨日赛果 $YESTERDAY（Apify Flashscore）..." \
-    $PYTHON get_results_flashscore.py --date "$YESTERDAY"
-run_step "[5/5] 昨日配对结算+追加样本 $YESTERDAY ..." \
-    $PYTHON settle_all.py --date "$YESTERDAY"
+# macOS bash 3.2 下多字节字符紧邻变量展开会吞字节，label 统一用 printf 拼
+if [ "$YESTERDAY_ROWS" -gt 0 ]; then
+    run_step "$(printf '[4/5] 回填昨日赛果 %s（Apify Flashscore）...' "$YESTERDAY")" \
+        $PYTHON get_results_flashscore.py --date "$YESTERDAY"
+    run_step "$(printf '[5/5] 昨日配对结算+追加样本 %s ...' "$YESTERDAY")" \
+        $PYTHON settle_all.py --date "$YESTERDAY"
+else
+    printf '⏭ [4/5]、[5/5] 跳过：昨日 %s 无赛程（%s 不存在或只有表头）\n\n' \
+        "$YESTERDAY" "$YESTERDAY_CSV"
+fi
 
 echo "=============================================="
 if [ ${#FAILED_STEPS[@]} -eq 0 ]; then
