@@ -44,15 +44,20 @@ class TestResolveWindow(unittest.TestCase):
 
 
 class TestResolveDays(unittest.TestCase):
-    """Actor days 参数：默认只请求目标日，傍晚运行才追加次日（省额度）。"""
+    """Actor days 参数：只请求目标日 D（最小化额度消耗）。
+
+    滚动窗口模式下，若 [D] 返回 0 场则由 main() 动态补拉 [D+1]，
+    这个 fallback 不在 resolve_days 内，因为需要先 fetch 才知道窗口有没有场。
+    """
 
     def test_morning_run_only_target_day(self):
         now = datetime(2026, 11, 12, 8, 33, tzinfo=CST)
         self.assertEqual(resolve_days("2026-11-12", now), ["2026-11-12"])
 
-    def test_evening_run_adds_next_day(self):
+    def test_evening_run_still_only_target_day(self):
+        # 新逻辑不再在 16:00 后追加 D+1；统一先拉 [D]，窗口空了 main() 再补
         now = datetime(2026, 11, 12, 16, 5, tzinfo=CST)
-        self.assertEqual(resolve_days("2026-11-12", now), ["2026-11-12", "2026-11-13"])
+        self.assertEqual(resolve_days("2026-11-12", now), ["2026-11-12"])
 
     def test_backfill_never_adds_next_day(self):
         now = datetime(2026, 11, 12, 20, 0, tzinfo=CST)

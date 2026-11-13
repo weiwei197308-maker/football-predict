@@ -390,17 +390,14 @@ def resolve_window(target_date, now_cst, hours=24):
 
 
 def resolve_days(target_date, now_cst):
-    """返回 Actor 的 days 参数。
+    """返回 Actor 的 days 参数（仅用于补跑历史）。
 
-    Actor 的 days 按联赛当地日期归档：当地 D 的比赛 ≈ CST D 下午至 D+1 上午，
-    已覆盖滚动窗口，故默认只请求目标日；16:00 后运行时窗口末端会进入次日当地
-    的下午场，此时追加次日，避免为窗口外的场次付费。
+    补跑历史日期：日历窗口固定用当地日期 D，不拉 D+1 避免额度浪费。
+    今日滚动窗口：由 main() 在 fetch 后动态决定——先拉 [D]，窗口为空再补 [D+1]。
     """
-    days = [target_date]
-    if now_cst.strftime("%Y-%m-%d") == target_date and now_cst.hour >= 16:
-        days.append((datetime.strptime(target_date, "%Y-%m-%d")
-                     + timedelta(days=1)).strftime("%Y-%m-%d"))
-    return days
+    if now_cst.strftime("%Y-%m-%d") != target_date:
+        return [target_date]
+    return [target_date]
 
 
 def main():
@@ -427,25 +424,61 @@ def main():
     print(f"[1/6] 拉取 Apify Flashscore：{target_date}，"
           f"白名单 {len(FLASHSCORE_COMPETITIONS)} 个联赛")
     run_now = datetime.now(fo.CST)
-    days = resolve_days(target_date, run_now)
     used = fo.monthly_usage(args.data_dir)
     print(f"  {fo.quota_message(used)}")
     if used >= fo.MONTHLY_QUOTA:
         sys.exit(f"错误：{fo.quota_message(used)} 已达免费额度，本轮不发起请求")
+
+    # 先算窗口（要知道 rolling vs calendar 才能决定 fallback 逻辑）
+    now_cst = datetime.now(fo.CST)
+    lower, window_end, window_mode = resolve_window(target_date, now_cst)
+    lower_naive = lower.replace(tzinfo=None)
+    window_end_naive = window_end.replace(tzinfo=None)
+
+    # 第一步：先拉目标日 D，只请求当地 D 避免额度浪费
+    days = [target_date]
     items, meta = fo.fetch_items(
         FLASHSCORE_COMPETITIONS, days=days, status="scheduled",
         max_results=args.fetch_max or max(args.max_matches * 3, 90))
     print(f"  Actor 返回 {len(items)} 场（days={days}，run_id={meta.get('run_id') or '-'}）")
 
+    # 快速过滤：白名单 + 窗口，判断有没有场需要分析
+    def _window_count(batch):
+        n = 0
+        for it in batch:
+            display = str((it.get("competition") or {}).get("display_name") or "")
+            if not resolve_league_cfg(display):
+                continue
+            try:
+                norm = fo.normalize_item(it, resolve_league_cfg(display))
+            except ValueError:
+                continue
+            ko = fo._cst_dt(norm["kickoff_utc"]).replace(tzinfo=None)
+            if lower_naive <= ko < window_end_naive:
+                n += 1
+        return n
+
+    wcount = _window_count(items)
+    # 滚动窗口里 [D] 返回 0 场 → 补拉 D+1（下午/晚间跑批时比赛实际归在次日当地日期）
+    if wcount == 0 and window_mode == "rolling":
+        d1 = (datetime.strptime(target_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        days2 = [d1]
+        items2, meta2 = fo.fetch_items(
+            FLASHSCORE_COMPETITIONS, days=days2, status="scheduled",
+            max_results=args.fetch_max or max(args.max_matches * 3, 90))
+        print(f"  滚动窗口内 0 场，补拉 {days2}：Actor 再返回 {len(items2)} 场")
+        items.extend(items2)
+        wcount2 = _window_count(items2)
+        wcount += wcount2
+        # meta 保留第二次（补拉）的 run_id，第一次 run_id 在后续原始 JSON 里已含
+        meta = meta2
+
     if not args.dry_run:
         raw_path = fo.save_raw(items, meta, target_date, args.data_dir)
         print(f"  原始响应已归档：{raw_path}")
 
-    # 2) 白名单 + 24h 窗口过滤 + 标准化
-    now_cst = datetime.now(fo.CST)
-    lower, window_end, window_mode = resolve_window(target_date, now_cst)
-    lower_naive = lower.replace(tzinfo=None)
-    window_end = window_end.replace(tzinfo=None)
+    # 2) 白名单 + 24h 窗口过滤 + 标准化（完整流程）
+    window_end = window_end_naive
     records, unknown_names, bad_items = [], defaultdict(int), 0
     known = 0
     for item in items:
