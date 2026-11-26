@@ -1,3 +1,4 @@
+import argparse
 import requests
 import csv
 import json
@@ -1098,7 +1099,73 @@ def save_analysis_csv(all_results, target_date, output_dir="output"):
         return None
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="M2 无赔率独立分析（抽样+低信心并集口径）")
+    parser.add_argument("--sample-n", type=int, default=10,
+                        help="每日固定抽样场次数：赛程 CSV 按行序（即 priority 排序后）取前 N 场（默认 10）")
+    parser.add_argument("--min-confidence", type=int, default=5,
+                        help="M1 信心指数 ≤ 该值的场次额外全量触发 M2（默认 5）")
+    parser.add_argument("--m1-csv", default=None,
+                        help="M1 分析 CSV 路径；默认按销售日推导 output/竞彩分析_{date}.csv")
+    return parser.parse_args(argv)
+
+
+def select_m2_matches(rows, sample_n, min_confidence, m1_csv):
+    """抽样+低信心并集筛选 M2 场次，保持赛程 CSV 原始行序并去重。
+
+    口径（2026-11-26 定，12-08 生效）：
+    - 固定抽样：赛程 CSV 前 sample_n 行（行序即 priority 排序后顺序）；
+    - 低信心增量：M1 CSV 中「信心指数 ≤ min_confidence」的场次全部加入；
+    - 最终场次 = 两者并集去重（按编号），M1 CSV 缺失/不可读时按纯抽样处理。
+    """
+    if sample_n <= 0:
+        raise ValueError(f"--sample-n 必须为正整数，当前为 {sample_n}")
+
+    sample_rows = list(rows[:sample_n])
+    sampled_nums = {r.get("编号", "") for r in sample_rows}
+
+    low_conf_nums = set()
+    if m1_csv:
+        if os.path.exists(m1_csv):
+            try:
+                with open(m1_csv, "r", encoding="utf-8-sig") as f:
+                    m1_rows = list(csv.DictReader(f))
+                if not m1_rows:
+                    print(f"提示：M1 CSV 无数据行（{m1_csv}），按纯抽样处理")
+                elif "编号" not in m1_rows[0] or "信心指数" not in m1_rows[0]:
+                    print(f"提示：M1 CSV 缺少「编号」或「信心指数」列（{m1_csv}），按纯抽样处理")
+                else:
+                    for r in m1_rows:
+                        num = (r.get("编号") or "").strip()
+                        conf_raw = str(r.get("信心指数") or "").strip()
+                        try:
+                            conf = int(float(conf_raw))
+                        except (TypeError, ValueError):
+                            continue
+                        if num and conf <= min_confidence:
+                            low_conf_nums.add(num)
+            except OSError as e:
+                print(f"提示：读取 M1 CSV 失败（{e}），按纯抽样处理")
+        else:
+            print(f"提示：M1 CSV 不存在（{m1_csv}），按纯抽样处理")
+    else:
+        print("提示：未指定 M1 CSV，按纯抽样处理")
+
+    selected = sample_rows
+    if low_conf_nums:
+        extra = [r for r in rows
+                 if r.get("编号", "") in low_conf_nums
+                 and r.get("编号", "") not in sampled_nums]
+        selected = sample_rows + extra
+        print(f"M2 抽样口径：前 {len(sample_rows)} 场固定抽样 + M1 低信心（信心指数≤{min_confidence}）"
+              f"{len(low_conf_nums)} 场，并集去重后共 {len(selected)} 场")
+    else:
+        print(f"M2 抽样口径：前 {len(sample_rows)} 场固定抽样，共 {len(selected)} 场（无低信心增量）")
+    return selected
+
+
 def main():
+    args = parse_args()
     api_key = os.environ.get("DEEPSEEK_API_KEY") or API_KEY_FALLBACK
     key_ok, key_err = validate_api_key(api_key)
     if not key_ok:
@@ -1127,6 +1194,12 @@ def main():
     target_date = today_str
     rows = load_matches_from_csv(csv_path)
 
+    # M2 抽样口径（2026-11-26 定）：固定抽样前 N 场 + M1 低信心场次全量，并集去重。
+    # M1 CSV 默认按销售日推导；补跑历史场景（临时改名绕过销售日保护）时若对应
+    # M1 CSV 不存在，按纯抽样处理（避免 M2 全量跑）。
+    m1_csv = args.m1_csv or os.path.join("output", f"竞彩分析_{target_date}.csv")
+    selected_rows = select_m2_matches(rows, args.sample_n, args.min_confidence, m1_csv)
+
     # 历史数据改由本地 history_cache 提供（不消耗 FOOTBALL_API_KEY 额度）
     global _history_lookup
     _history_lookup = load_history_lookup(csv_path)
@@ -1149,13 +1222,13 @@ def main():
     shadow_records_hafu = []
     shadow_collected_hafu = 0
 
-    for i, row in enumerate(rows, 1):
+    for i, row in enumerate(selected_rows, 1):
         home = row.get("主队", "")
         away = row.get("客队", "")
         match_num = row.get("编号", "")
         league = row.get("联赛", "")
 
-        print(f"\n[{i}/{len(rows)}] 正在查询历史数据 {match_num} {home} vs {away} ...", end=" ", flush=True)
+        print(f"\n[{i}/{len(selected_rows)}] 正在查询历史数据 {match_num} {home} vs {away} ...", end=" ", flush=True)
         try:
             history = build_history_for_match(home, away)
             hist_flag = "OK" if history.get("available") else "跳过"

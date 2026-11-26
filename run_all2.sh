@@ -64,8 +64,8 @@ run_step "[1/5] 获取今日赛程+赔率+历史（Apify Flashscore，每日上�
     $PYTHON get_matches_flashscore.py --date "$DATE"
 run_step "[2/5] M1 带赔率分析（analyze.py 原样，wrapper 注入历史缓存）..." \
     $PYTHON run_analyze_m1.py
-run_step "[3/5] M2 无赔率独立分析（可能要等几分钟）..." \
-    $PYTHON analyze_independent.py
+run_step "[3/5] M2 无赔率独立分析（前10场抽样+M1低信心并集，可能要等几分钟）..." \
+    $PYTHON analyze_independent.py --sample-n 10 --min-confidence 5
 # macOS bash 3.2 下多字节字符紧邻变量展开会吞字节，label 统一用 printf 拼
 if [ "$YESTERDAY_ROWS" -gt 0 ]; then
     run_step "$(printf '[4/5] 回填昨日赛果 %s（Apify Flashscore）...' "$YESTERDAY")" \
