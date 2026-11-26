@@ -137,6 +137,11 @@ FLASHSCORE_ALIASES = {
     "ITALY: Serie C - Group A": 138,
     "ITALY: Serie C - Group B": 138,
     "ITALY: Serie C - Group C": 138,
+    # 2026-11-26：Flashscore 给欧战改名，display_name 追加 " - League phase" 后缀，
+    # 旧名称精确匹配失效导致整批欧战场次被判「未收录」。赛事范围不变，仅补名称别名。
+    "EUROPE: Champions League - League phase": 2,
+    "EUROPE: Europa League - League phase": 3,
+    "EUROPE: Conference League - League phase": 848,
 }
 for _alias, _api_id in FLASHSCORE_ALIASES.items():
     if _api_id in _BY_API_ID_ALL:
